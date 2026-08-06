@@ -1,0 +1,30 @@
+name: ci
+
+# The project's gate is the pytest suite (see CLAUDE.md). No linter runs here:
+# the repository has no ruff/mypy configuration, and bolting one on would turn
+# every pre-existing style choice into a red build.
+on:
+  pull_request:
+  # master is covered by deploy.yml, which calls this workflow before shipping —
+  # without the ignore every push to master would run the suite twice.
+  push:
+    branches-ignore: [master]
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Pytest
+        run: python -m pytest tests -q

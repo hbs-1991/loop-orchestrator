@@ -1,0 +1,3 @@
+{$LOOP_WEBHOOK_HOST} {
+	reverse_proxy loop-orchestrator:8000
+}

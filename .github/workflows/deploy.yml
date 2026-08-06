@@ -1,0 +1,83 @@
+name: deploy
+
+# Ships master to the VPS the orchestrator runs on. Mirrors the manual flow it
+# replaces: tar the tracked tree over ssh into ~/loop, then rebuild the compose
+# stack in place.
+#
+# ~/loop is NOT a git checkout — it also holds .env, data/ (the SQLite database)
+# and secrets/, none of which live in this repository. That is why this ships an
+# explicit file list instead of syncing the whole directory, and why nothing here
+# ever deletes on the remote side. A file removed from the repository therefore
+# lingers on the VPS until someone removes it by hand.
+#
+# The sandbox image (deploy/sandbox-image) is deliberately NOT rebuilt here: it
+# is a ~4.5 GB build shared with sandboxd and changes rarely. Rebuild it by hand
+# after touching deploy/sandbox-image — see the header of its Dockerfile.
+on:
+  push:
+    branches: [master]
+
+# Never let two deploys interleave on the same box; queue them instead.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure ssh
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pinned host key: without it StrictHostKeyChecking would have to be
+          # disabled, which turns every deploy into a trust-on-first-use.
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # GitHub runners intermittently fail the first TCP connect to the VPS
+      # (two deploys on 2026-08-05 died to "port 22: Connection timed out"
+      # while the host answered from elsewhere) — probe until it answers so a
+      # transient blackout costs a retry, not the deploy.
+      - name: Wait for ssh to be reachable
+        run: |
+          for i in $(seq 1 8); do
+            if ssh -o BatchMode=yes -o ConnectTimeout=10 "$DEPLOY_USER@$DEPLOY_HOST" true; then
+              exit 0
+            fi
+            echo "ssh attempt $i failed; retrying in 20s" >&2
+            sleep 20
+          done
+          echo "VPS unreachable over ssh after 8 attempts" >&2
+          exit 1
+
+      - name: Ship the tree
+        run: |
+          tar -cf - src pyproject.toml Dockerfile docker-compose.yml Caddyfile deploy \
+            | ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" 'tar -x -C ~/loop'
+
+      - name: Rebuild and restart
+        run: |
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            'cd ~/loop && docker compose up -d --build'
+
+      - name: Health check
+        run: |
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" '
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8000/healthz; then echo; echo "healthy"; exit 0; fi
+              sleep 2
+            done
+            echo "still unhealthy after 60s — last logs:" >&2
+            cd ~/loop && docker compose logs --tail=60 loop-orchestrator >&2
+            exit 1'

@@ -1,0 +1,4 @@
+# Project Wiki (LLM-Wiki / project memory) — auto-injected by the SessionStart hook
+This is the persistent memory of the project (docs/wiki/). Below: the map (index), the current state
+(overview) and the latest log entries. Dig into individual pages as needed.
+The rules for keeping and updating the wiki are in docs/wiki/conventions.md.

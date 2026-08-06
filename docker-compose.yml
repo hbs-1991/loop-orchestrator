@@ -1,0 +1,30 @@
+services:
+  loop-orchestrator:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro
+    networks: [sandboxd_net]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    environment:
+      - LOOP_WEBHOOK_HOST=${LOOP_WEBHOOK_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    networks: [sandboxd_net]
+
+networks:
+  sandboxd_net:
+    external: true
+
+volumes:
+  caddy_data:
