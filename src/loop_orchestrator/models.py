@@ -13,12 +13,14 @@ STAGING = "staging"
 AWAITING_APPROVAL = "awaiting_approval"
 CANCELLED = "cancelled"
 PLANNING = "planning"
+CONTRACTING = "contracting"
 
 ACTIVE_STATES = {QUEUED, PREPARING, PLANNING, EXECUTING, REVIEWING, E2E_TESTING,
-                 STAGING, AWAITING_APPROVAL, PUBLISHING, REPORTING}
+                 CONTRACTING, STAGING, AWAITING_APPROVAL, PUBLISHING, REPORTING}
 
 # States from which a human may cancel a run (before its work is staged).
-CANCELABLE = {QUEUED, PREPARING, PLANNING, EXECUTING, REVIEWING, E2E_TESTING}
+CANCELABLE = {QUEUED, PREPARING, PLANNING, EXECUTING, REVIEWING, E2E_TESTING,
+              CONTRACTING}
 
 
 @dataclass
@@ -59,6 +61,19 @@ class Run:
     sandbox_expires_at: str | None = None  # UTC "YYYY-MM-DD HH:MM:SS"
     merged_at: str | None = None
     tg_approval_message_id: int | None = None
+    # The "finished" message that carries the merge buttons. Kept so the reaper
+    # can repaint that keyboard as the PR's gate state changes.
+    tg_merge_message_id: int | None = None
     kind: str = "pr"  # pr | planning
     issue_number: int | None = None
     lane: str | None = None
+    # Planning knobs, read from `.loop.yml` at prepare. A model of None means
+    # "use the LOOP_* setting"; plan_max_iterations of None means the same.
+    planner_model: str | None = None
+    advisor_enabled: bool = True
+    advisor_model: str | None = None
+    plan_max_iterations: int | None = None
+    # Set at prepare: only a Run tied to an issue can hand anything downstream.
+    contract_enabled: bool = False
+    contract_status: str | None = None  # produced | none | skipped | failed
+    contract_json: str | None = None    # the captured Contract, for Telegram

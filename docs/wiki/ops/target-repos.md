@@ -47,11 +47,28 @@ API contract → e2e brought up **both services in a single sandbox**, 8 Playwri
 - **The PAT has no Administration scope** — you cannot create a repository with it (the user does
   that), and a new repository must be **added to the fine-grained PAT's list**, otherwise 404.
 - `gh api` for `blocked_by` requires `-F issue_id=…` (a number); `-f` sends a string.
-- The production repos have **no branch protection** — which is exactly why the CI gate lives in the
-  orchestrator ([[decisions/0006-merge-gate-and-conflict-resolver]]). The user got a rulesets guide
-  (required checks: backend `ci`; frontend `Lint`/`Unit & Integration Tests`/`Build`; deploy-side
-  checks are **not** required — they don't run on PRs; the bypass list stays empty, otherwise the
-  owner's PAT would sidestep the rule).
+- The production repos started with **no branch protection** — the reason the CI gate lives in the
+  orchestrator at all ([[decisions/0006-merge-gate-and-conflict-resolver]]). A ruleset exists now;
+  as of 2026-08-08 the backend requires `gates`, `tests-selective` and `image`. We never hardcode
+  that list — `required_checks` reads `/repos/{repo}/rules/branches/{base}` on every press, which is
+  why the CI rebuild below cost us no change at all. The strict "up to date" rule is **off** (see
+  [[concepts/publication]] on why we compute `behind_by` ourselves), and the bypass list stays empty,
+  otherwise the owner's PAT would sidestep the rule.
+- **CI runs on a self-hosted pool since 2026-08-07** (backend ADR 0076). The org exhausted its
+  GitHub-hosted minutes, so every job in both repos moved to `runs-on: ${{ vars.CI_RUNNER }}` →
+  label `ssc-build` → two ephemeral runners on the **old** 2-core VPS the loop stack vacated on
+  2026-08-06. Three consequences for us:
+  - **Self-hosted minutes are not billed**, which is why the buttons work again despite the payment
+    block on Actions.
+  - **Two slots, shared by both repos.** A PR now runs `gates` + `tests-selective` + `image`
+    (docker build + Trivy) on two cores, so `checks_pending` lasts materially longer than it did on
+    GitHub-hosted runners, and `update-branch` after a `behind_by > 0` costs a full re-run of all
+    three. `behind_by == 0` short-circuiting matters more here than it did.
+  - **The runner box is a single point of failure for our buttons.** Both runners down or busy ⇒
+    every merge answers "checks are still running" forever. Diagnose it as
+    `gh api orgs/<org>/actions/runners`, not as a loop bug; the owner's escape hatch is setting the
+    org variable `CI_RUNNER` to `ubuntu-latest`.
+  - `tests-full` was removed for good (~25 min on two cores) and the coverage floor went with it.
 - Promotion to staging is picked up by the `promote-staging.yml` workflow **only in the backend**; in
   the frontend the `Merge & Deploy` button is harmless but triggers no deploy.
 

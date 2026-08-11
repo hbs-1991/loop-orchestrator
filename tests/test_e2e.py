@@ -20,6 +20,7 @@ from loop_orchestrator.e2e import (
     parse_e2e_verdict,
     select_video_paths,
 )
+from loop_orchestrator.review import WORKING_EFFICIENTLY
 
 PASSED_JSON = json.dumps({
     "verdict": "passed", "summary": "all good",
@@ -87,6 +88,51 @@ def test_fix_prompt_lists_only_failing():
     assert "logout" not in p
     assert "npm test" in p
     assert "Do not weaken" in p
+
+
+def test_e2e_prompt_is_self_contained_for_a_cold_session():
+    # The e2e task runs in a brand-new Claude session, and the same prompt is
+    # re-submitted after every fix iteration: scenarios from the previous round
+    # exist on disk but not in the agent's memory.
+    p = build_e2e_prompt("docs/specs/x-design.md", "npm run dev", {})
+    assert "fresh session" in p and "no conversation to recall" in p
+    assert "read them from disk" in p
+    assert "do not rewrite them from scratch" in p
+    assert f"`{E2E_DIR}/` — list that directory" in p
+
+
+def test_e2e_fix_prompt_is_self_contained_for_a_cold_session():
+    v = E2EVerdict(verdict="failed", summary="s", main_video=None,
+                   tests=[E2ETest(title="login", status="failed", video=None)])
+    p = build_e2e_fix_prompt(v, None, "docs/specs/x-design.md", "npm run dev",
+                             {"E2E_BASE_URL": "http://localhost:3000"},
+                             {"DB_PASSWORD": "hunter2"})
+    assert "fresh session" in p and "no earlier conversation" in p
+    assert "complete report" in p
+    # The scenarios must be re-read from disk, not remembered.
+    assert "on disk in this repository" in p and "grep -rn" in p
+    assert E2E_DIR in p
+    # The harness: without it the fixer patches blind.
+    assert "docs/specs/x-design.md" in p
+    assert "npm run dev" in p and "E2E_BASE_URL=http://localhost:3000" in p
+    # Secret names travel, values never do.
+    assert "DB_PASSWORD" in p and "hunter2" not in p
+
+
+def test_e2e_fix_prompt_degrades_without_a_harness():
+    v = E2EVerdict(verdict="failed", summary="s", main_video=None,
+                   tests=[E2ETest(title="login", status="failed", video=None)])
+    p = build_e2e_fix_prompt(v, None)
+    assert "Environment variables" not in p and "Specification:" not in p
+    assert "fresh session" in p
+
+
+def test_e2e_prompts_carry_the_efficiency_block():
+    v = E2EVerdict(verdict="failed", summary="s", main_video=None,
+                   tests=[E2ETest(title="login", status="failed", video=None)])
+    for p in (build_e2e_prompt("docs/specs/x-design.md", "npm run dev", {}),
+              build_e2e_fix_prompt(v, "npm test")):
+        assert WORKING_EFFICIENTLY in p
 
 
 def test_report_dict_roundtrip():

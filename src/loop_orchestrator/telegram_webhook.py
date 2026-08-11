@@ -16,7 +16,19 @@ router = APIRouter()
 log = logging.getLogger(__name__)
 
 ACTION_CODES = {"ap": "approve", "dc": "discard", "cn": "cancel",
-                "rs": "restart", "mg": "merge", "md": "merge_deploy"}
+                "rs": "restart", "mg": "merge", "md": "merge_deploy",
+                "ub": "update_branch"}
+
+# Not an action: the indicator button. Pressing it re-reads the gate and
+# answers in the toast, so a stale keyboard can be refreshed on demand instead
+# of waiting for the next reaper pass.
+GATE_CODE = "ck"
+
+_GATE_TEXT = {
+    "clean": "ready to merge",
+    "behind": "the branch is behind its base — press Update branch",
+    "conflicts": "the PR conflicts with its base",
+}
 
 
 @router.post("/webhooks/telegram")
@@ -44,6 +56,9 @@ async def _handle_callback(app: FastAPI, cq: dict) -> None:
     if user_id not in settings.admin_ids():
         await tg.answer_callback(callback_id, "not authorized")
         return
+    if code == GATE_CODE and run_id_s.isdigit():
+        await tg.answer_callback(callback_id, await _gate_text(app, int(run_id_s)))
+        return
     if code not in ACTION_CODES or not run_id_s.isdigit():
         await tg.answer_callback(callback_id, "unknown action")
         return
@@ -52,6 +67,24 @@ async def _handle_callback(app: FastAPI, cq: dict) -> None:
     task = asyncio.create_task(_run_action(
         app, ACTION_CODES[code], int(run_id_s), user_id, button_message_id))
     _keep(app, task)
+
+
+async def _gate_text(app: FastAPI, run_id: int) -> str:
+    """One line for the callback toast — never raises, the toast is cosmetic."""
+    try:
+        run = await dbmod.get_run(app.state.db, run_id)
+        if run is None:
+            return "run not found"
+        g = await app.state.actions.gate(run)
+        if g.state == "checks_failed":
+            return f"CI is red: {', '.join(g.red) or '?'}"
+        if g.state == "checks_pending":
+            waiting = f" — waiting on {', '.join(g.red)}" if g.red else ""
+            return f"checks {g.done}/{g.total} done{waiting}"
+        return _GATE_TEXT.get(g.state, g.state)
+    except Exception:  # noqa: BLE001
+        log.warning("gate read failed for run=%s", run_id, exc_info=True)
+        return "could not read the checks"
 
 
 async def _handle_message(app: FastAPI, msg: dict) -> None:

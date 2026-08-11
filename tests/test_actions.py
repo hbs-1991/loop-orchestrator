@@ -72,6 +72,8 @@ async def test_revise_resubmits_and_resets_cycles(db):
     run = await make_run_in(db, AWAITING_APPROVAL, staging_branch="loop/run-1",
                             review_status="clean", review_iteration=1,
                             e2e_status="passed", e2e_iteration=2,
+                            spec_path="docs/spec.md", plan_path="docs/plan.md",
+                            test_cmd="pytest -q",
                             sandbox_expires_at="2026-08-03 10:00:00")
     await actions.revise(run.id, actor=1, feedback="make the button blue")
     fresh = await dbmod.get_run(db, run.id)
@@ -82,9 +84,28 @@ async def test_revise_resubmits_and_resets_cycles(db):
     assert fresh.e2e_status is None and fresh.e2e_iteration == 0
     assert fresh.sandbox_expires_at is None
     task = sb.tasks_submitted[-1]
-    assert "make the button blue" in task["prompt"] and task["continue"]
+    assert "make the button blue" in task["prompt"]
+    # review ran, so its session is the most recent one: continuing would land
+    # in the reviewer's, not the executor's. Fresh, with the context restated.
+    assert task["continue"] is False
+    assert "origin/feat/x..HEAD" in task["prompt"]
+    assert "docs/spec.md" in task["prompt"] and "pytest -q" in task["prompt"]
     assert fresh.task_id is not None
     assert worker.enqueued == [run.id]
+
+
+async def test_revise_resumes_the_executor_session_when_it_is_the_last_one(db):
+    """Nothing runs after the executor when both verification stages are off,
+    so `continue` reaches its session and the prompt can stay short."""
+    actions, gh, sb, tg, worker = make_actions(db)
+    run = await make_run_in(db, AWAITING_APPROVAL, staging_branch="loop/run-1",
+                            review_enabled=False, e2e_enabled=False,
+                            test_cmd="pytest -q")
+    await actions.revise(run.id, actor=1, feedback="make the button blue")
+    task = sb.tasks_submitted[-1]
+    assert task["continue"] is True
+    assert "make the button blue" in task["prompt"] and "pytest -q" in task["prompt"]
+    assert "fresh session" not in task["prompt"]
 
 
 async def test_revise_fails_after_preview_expiry(db):
@@ -265,6 +286,89 @@ async def test_merge_behind_updates_branch_instead_of_merging(db):
     assert (await dbmod.get_run(db, run.id)).merged_at is None
 
 
+async def test_merge_detects_a_stale_branch_a_clean_state_hides(db):
+    """The work repos dropped the strict rule, so GitHub stops sending
+    `mergeable_state: "behind"` — a branch that is commits behind main arrives
+    labelled `clean` with green checks. Those checks measured a tree that will
+    not exist after the merge, so the state is computed instead of trusted."""
+    actions, gh, *_ = make_actions(db)
+    run = await make_run_in(db, DONE)
+    gh.pr_info = {"mergeable": True, "mergeable_state": "clean",
+                  "base": {"ref": "main"},
+                  "head": {"sha": "headsha", "ref": "feat/x"}}
+    gh.check_runs = [{"name": "ci", "status": "completed",
+                      "conclusion": "success"}]
+    gh.behind = 2
+
+    result = await actions.merge(run.id, actor=1)
+
+    assert gh.compares == [("main", "feat/x")]
+    assert "updated" in result and "press" in result
+    assert gh.branch_updates == [5]
+    assert gh.merges == []
+
+
+async def test_merge_does_not_sync_a_branch_that_is_already_current(db):
+    """behind_by == 0 must merge on the first press: an empty merge commit is
+    itself a push, and costs the full CI run this check exists to save."""
+    actions, gh, *_ = make_actions(db)
+    run = await make_run_in(db, DONE)
+    gh.pr_info = {"mergeable": True, "mergeable_state": "clean",
+                  "base": {"ref": "main"},
+                  "head": {"sha": "headsha", "ref": "feat/x"}}
+    gh.check_runs = [{"name": "ci", "status": "completed",
+                      "conclusion": "success"}]
+    gh.behind = 0
+
+    await actions.merge(run.id, actor=1)
+
+    assert gh.branch_updates == []
+    assert gh.merges == [(5, "feat: x (#5)")]
+
+
+async def test_gate_counts_progress_against_the_required_checks(db):
+    """The button says "2/3" of what actually holds the merge, not of whatever
+    happened to start — an unrequired check must not inflate the denominator."""
+    actions, gh, *_ = make_actions(db)
+    run = await make_run_in(db, DONE)
+    gh.pr_info = {"mergeable": True, "mergeable_state": "clean",
+                  "base": {"ref": "main"},
+                  "head": {"sha": "headsha", "ref": "feat/x"}}
+    gh.required_check_names = ["gates", "tests-selective", "image"]
+    gh.check_runs = [
+        {"name": "gates", "status": "completed", "conclusion": "success"},
+        {"name": "tests-selective", "status": "completed", "conclusion": "success"},
+        {"name": "image", "status": "in_progress"},
+        {"name": "Claude Code Review", "status": "completed", "conclusion": "success"},
+    ]
+
+    g = await actions.gate(run)
+
+    assert (g.state, g.done, g.total) == ("checks_pending", 2, 3)
+
+
+async def test_update_branch_refuses_once_the_branch_is_current(db):
+    """The button promises one thing. If the gate turned clean between the
+    repaint and the press, updating would create an empty merge commit — and
+    merging instead would be a merge the user never asked for."""
+    actions, gh, *_ = make_actions(db)
+    run = await make_run_in(db, DONE)
+    gh.pr_info = {"mergeable": True, "mergeable_state": "clean",
+                  "base": {"ref": "main"},
+                  "head": {"sha": "headsha", "ref": "feat/x"}}
+    gh.check_runs = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+    gh.behind = 0
+
+    with pytest.raises(ActionError, match="not behind"):
+        await actions.update_branch(run.id, actor=1)
+    assert gh.branch_updates == [] and gh.merges == []
+
+    gh.behind = 3
+    result = await actions.update_branch(run.id, actor=1)
+    assert gh.branch_updates == [5] and gh.merges == []
+    assert "behind" in result
+
+
 async def test_merge_conflicts_resolves_then_merges(db):
     actions, gh, sb, tg, worker = make_actions(db)
     run = await make_run_in(db, DONE)
@@ -373,6 +477,18 @@ async def test_revise_starts_a_fresh_card(db):
     # the old card is abandoned; a new one is posted for the fix cycle
     assert fresh.tg_card_message_id == 555          # FakeTG.send_card
     assert EXECUTING in tg.card_states
+
+
+async def test_revise_wakes_the_sleeping_pause_sandbox(db):
+    """The pause stops its sandbox, so a revise has to wake it before submitting
+    — otherwise the submit lands on a stopped container and the button reports
+    'could not reach the sandbox' on a Run that is perfectly alive."""
+    actions, gh, sb, tg, worker = make_actions(db)
+    run = await make_run_in(db, AWAITING_APPROVAL, staging_branch="loop/run-1")
+    sb.sandbox_info = {"status": "stopped"}
+    await actions.revise(run.id, actor=1, feedback="make the button blue")
+    assert sb.started == [run.sandbox_id]
+    assert sb.tasks_submitted, "the revise task must reach the woken sandbox"
 
 
 async def test_revise_submit_failure_keeps_staged_branch(db):

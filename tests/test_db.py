@@ -1,3 +1,5 @@
+import json
+
 import aiosqlite
 
 from loop_orchestrator import db as dbmod
@@ -238,3 +240,39 @@ async def test_previous_app_ids_for_issue(db):
 def test_utcnow_format():
     s = dbmod.utcnow()
     assert len(s) == 19 and s[4] == "-" and s[13] == ":"
+
+
+async def test_contract_round_trip_and_replacement(db):
+    await dbmod.save_contract(db, "o/backend", 12, run_id=7, pr_number=45,
+                              head_sha="abc1234", contract_md="### GET /x",
+                              sources=["src/api.py"], breaking=["drops v0"])
+    row = await dbmod.get_contract(db, "o/backend", 12)
+    assert row["contract_md"] == "### GET /x"
+    assert json.loads(row["sources_json"]) == ["src/api.py"]
+    assert json.loads(row["breaking_json"]) == ["drops v0"]
+    assert row["pr_number"] == 45 and row["head_sha"] == "abc1234"
+
+    # A revise re-runs the stage; the later capture is the one that shipped.
+    await dbmod.save_contract(db, "o/backend", 12, run_id=8, pr_number=45,
+                              head_sha="def5678", contract_md="### GET /y",
+                              sources=[], breaking=[])
+    row = await dbmod.get_contract(db, "o/backend", 12)
+    assert row["contract_md"] == "### GET /y" and row["run_id"] == 8
+
+
+async def test_get_contract_is_none_when_never_captured(db):
+    assert await dbmod.get_contract(db, "o/backend", 99) is None
+
+
+async def test_run_carries_contract_columns(db):
+    run = await dbmod.create_run(db, "o/r", 5, "b")
+    # SQLite hands booleans back as 0/1, so assert truthiness, not identity.
+    assert not run.contract_enabled
+    assert run.contract_status is None and run.contract_json is None
+    run.contract_enabled = True
+    run.contract_status = "produced"
+    run.contract_json = '{"outcome": "contract"}'
+    await dbmod.save_run(db, run)
+    reloaded = await dbmod.get_run(db, run.id)
+    assert reloaded.contract_status == "produced"
+    assert json.loads(reloaded.contract_json)["outcome"] == "contract"

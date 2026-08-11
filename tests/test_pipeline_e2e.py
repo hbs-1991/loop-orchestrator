@@ -49,6 +49,9 @@ async def test_e2e_passed_first_try(db):
     assert report["main_video"] == ".loop/e2e/main.mp4"
     assert len(sb.tasks_submitted) == 1
     assert sb.tasks_submitted[0]["model"] is None  # e2e_model="" -> executor default
+    # A fresh session: the e2e prompt is self-contained, and inheriting the
+    # executor's context would be re-sent (and re-cached) on every call.
+    assert sb.tasks_submitted[0]["continue"] is False
 
 
 async def test_e2e_fix_cycle_then_passed(db):
@@ -64,6 +67,8 @@ async def test_e2e_fix_cycle_then_passed(db):
     assert run.e2e_iteration == 1
     assert len(sb.tasks_submitted) == 3
     assert "Do not weaken" in sb.tasks_submitted[1]["prompt"]
+    # Every task of the cycle starts clean — including the fix task.
+    assert [t["continue"] for t in sb.tasks_submitted] == [False, False, False]
 
 
 async def test_e2e_escalates_at_limit(db):

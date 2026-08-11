@@ -3,13 +3,15 @@
 - **Files:** `src/loop_orchestrator/worker.py`, `scheduler.py`, `issue_tasks.py`
 - **Tests:** `tests/test_worker.py`, `test_scheduler.py`, `test_scheduler_bootstrap.py`,
   `test_issue_tasks.py`
-- **Related:** [[concepts/run-lifecycle]] · [[concepts/resilience]]
+- **Related:** [[concepts/run-lifecycle]] · [[concepts/resilience]] · [[concepts/contract-handoff]]
 
 ## Worker
 
 An in-process asyncio queue: `LOOP_MAX_CONCURRENT_RUNS` consumers (**2** on the VPS, see
-[[concepts/resilience]]), `recover()` on startup picks up Runs left in active states, `_reap_loop`
-finishes off the sandboxes of expired pauses (`expire_preview`).
+[[concepts/resilience]]), `recover()` on startup re-enqueues the restartable states
+(`queued/planning/executing/reviewing/e2e_testing/contracting` — each stage begins a fresh iteration
+and `contracting` overwrites the row it keys), `_reap_loop` finishes off the sandboxes of expired
+pauses (`expire_preview`).
 
 No Celery, no Redis — the state lives entirely in SQLite, and a restart is survived via `recover()`.
 
@@ -27,10 +29,33 @@ Inside a tick: `_sync` (mirrors `loop:ready` issues into the `issue_tasks` table
 an exclusive task. An accepted limitation: exclusive tasks can starve (option A from the phase-5
 spec).
 
+**A lane is held by whatever the mirror calls `running`**, so `_resolve_running` is what keeps the
+backlog moving — and it judges the run the mirror *points at*, not reality. An issue goes through two
+runs: the planning run, then the PR run its plan produced, and the mirror follows that handoff in
+`webhook._link_issue_task`. Miss the handoff and the row keeps pointing at a planning run that
+finished long ago, which no branch could resolve — the lane is then held forever. Seen live: issue #10
+sat in `running` for a day on a finished planning run while its PR was already merged, and returning
+two other issues to the backlog started nothing. `_resolve_running` now recovers the handoff from the
+runs table instead of trusting the recorded id.
+
 **Blocking** uses native GitHub dependencies: `GET /repos/{r}/issues/{n}/dependencies/blocked_by`.
 They work **across repositories** (verified by the smoke test of 2026-08-04: a backend issue blocked
 a frontend issue in another repo). `POST` takes `{"issue_id": <id>}` — the global id, **not** the
-number; via `gh api` that is `-F issue_id=...` (a number), `-f` would send a string.
+number; via `gh api` that is `-F issue_id=...` (a number), `-f` would send a string. The reverse
+direction, `.../dependencies/blocking`, is a real endpoint too (probed 2026-08-10) and is what the
+`contracting` stage triggers on.
+
+**One call, two answers.** The `BACKLOG` branch of `_sync` calls `gh.issue_dependencies` once and
+writes both `blocked_by` (open blockers only — the launch gate `_launch_ready` runs on, semantics
+unchanged) and `depends_on` (every dependency as `{repo, number}`, open or closed). The second column
+exists because the first empties precisely when the handoff needs it: at the moment the blocker
+closes ([[concepts/contract-handoff]]).
+
+**`_launch_ready` collects the upstreams before bootstrapping.**
+`collect_upstreams(db, gh, task)` resolves each `depends_on` entry into an `Upstream`, and
+`bootstrap(...)` commits the rendered `## Upstream dependencies` section into `.loop/task.md`. It runs
+before the sandbox exists, so the digest reaches the planner through the branch, not through an
+upload.
 
 **Unblocking is caught by the poller, not by the webhook:** a `closed` event ticks only its own
 repository.

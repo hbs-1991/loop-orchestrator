@@ -21,6 +21,7 @@
 | [publication](concepts/publication.md) | Two-phase publication, merge gates, promotion to staging |
 | [secrets-delivery](concepts/secrets-delivery.md) | Secrets as the `.loop/secrets.env` file, and why not via app config |
 | [agent-steering](concepts/agent-steering.md) | Five channels for steering the agent: prompt, model, image skills, repo skills, JSON verdict |
+| [contract-handoff](concepts/contract-handoff.md) | The `contracting` stage, and how a producer's API reaches a dependent task's planner |
 | [resilience](concepts/resilience.md) | What breaks in production: stream drops, the idle reaper, VPS overload, restarts |
 
 ## Components — code subsystems
@@ -32,6 +33,7 @@
 | [ingress-and-control](components/ingress-and-control.md) | `webhook.py`, `telegram_webhook.py`, `actions.py`, `main.py` |
 | [clients](components/clients.md) | `clients/` — GitHub, sandboxd, Telegram, retry |
 | [storage-and-config](components/storage-and-config.md) | `db.py`, `models.py`, `state_machine.py`, `config.py`, `loopconfig.py`, `secrets.py` |
+| [tracing](components/tracing.md) | `tracing/`, `clients/otlp.py` — where a Run's money and context went |
 
 ## Ops — live infrastructure
 
@@ -59,6 +61,10 @@ Full table — [decisions/README.md](decisions/README.md).
 | [0009](decisions/0009-concurrency-cap-and-poll-resilience.md) | Cap of 2 Runs and tolerant polling |
 | [0010](decisions/0010-documentation-in-english.md) | Every document in the repository is English (open source) |
 | [0011](decisions/0011-no-environment-specifics-in-the-repo.md) | Environment specifics are placeholders, never literals |
+| [0012](decisions/0012-one-bigger-host-over-a-multi-host-pool.md) | One bigger host, not a pool of small ones; measured sizing rule |
+| [0013](decisions/0013-one-session-per-stage.md) | One Claude session per stage, and the `continue` tri-state |
+| [0014](decisions/0014-hand-rolled-otlp-emitter.md) | A hand-rolled OTLP emitter, not the OpenTelemetry SDK |
+| [0015](decisions/0015-sleep-the-paused-sandbox.md) | The paused sandbox sleeps; its preview wakes it on demand |
 
 ## Sources of truth (don't duplicate — link)
 

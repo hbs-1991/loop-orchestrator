@@ -22,9 +22,45 @@ services:
       - caddy_data:/data
     networks: [sandboxd_net]
 
+  # Agent tracing. Off unless LOOP_OTLP_ENDPOINT is set in .env — the
+  # orchestrator simply never exports, and this container idles.
+  # Spec: docs/superpowers/specs/2026-08-06-agent-tracing-otel.md
+  jaeger:
+    # Pinned to a real 1.x tag: the 1.x line is `SPAN_STORAGE_TYPE`-configured,
+    # while 2.x replaces that with an OTel-collector config file. Tags are
+    # three-part — `1.62` does not exist and pulls fail with "manifest unknown".
+    image: jaegertracing/all-in-one:1.76.0
+    restart: unless-stopped
+    # The image runs as uid 10001, but `/badger` does not exist in it, so Docker
+    # creates the named volume's mountpoint root-owned and badger dies on
+    # "mkdir /badger/key: permission denied". Docker only inherits ownership for
+    # a path that already exists in the image, so there is nothing to inherit
+    # here; running this one container as root is the fix that does not involve
+    # an init container just to chown an empty directory.
+    user: "0:0"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
+      # Hours, not days: compose cannot multiply, and "${DAYS}0h" silently
+      # concatenates into 140h — 5.8 days pretending to be 14.
+      - BADGER_SPAN_STORE_TTL=${LOOP_TRACE_RETENTION_HOURS:-336}h
+    ports:
+      # 127.0.0.1 ONLY. Jaeger has no authentication of its own and the spans
+      # carry prompt and tool-result previews; reach the UI over an ssh tunnel:
+      #   ssh -L 16686:127.0.0.1:16686 deploy@<vps-ip>
+      - "127.0.0.1:16686:16686"   # UI
+      - "127.0.0.1:4318:4318"     # OTLP/HTTP — what the orchestrator posts to
+    volumes:
+      - jaeger_data:/badger
+    networks: [sandboxd_net]
+
 networks:
   sandboxd_net:
     external: true
 
 volumes:
   caddy_data:
+  jaeger_data:

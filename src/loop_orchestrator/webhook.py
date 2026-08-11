@@ -29,6 +29,34 @@ def _spawn_tick(app: FastAPI, repo: str, seed_issues: list[dict]) -> None:
     task.add_done_callback(tasks.discard)
 
 
+def _spawn_repaint(app: FastAPI, payload: dict) -> None:
+    """Move the merge keyboard of whichever PR this check run belongs to.
+
+    A gate read costs a few GitHub calls, and GitHub gives a webhook ten
+    seconds, so this runs detached like the scheduler tick.
+    """
+    worker = getattr(app.state, "worker", None)
+    repo = (payload.get("repository") or {}).get("full_name")
+    numbers = [pr.get("number")
+               for pr in (payload.get("check_run") or {}).get("pull_requests") or []
+               if isinstance(pr.get("number"), int)]
+    if worker is None or not repo or not numbers:
+        return
+
+    async def repaint() -> None:
+        for number in numbers:
+            run = await dbmod.repaintable_run_for_pr(app.state.db, repo, number)
+            if run is not None:
+                await worker.repaint_merge_buttons(run)
+
+    tasks = getattr(app.state, "tick_tasks", None)
+    if tasks is None:
+        tasks = app.state.tick_tasks = set()
+    task = asyncio.create_task(repaint())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
 def _ready_seeds(payload: dict) -> list[dict]:
     """The payload's own issue, when it is open and labeled loop:ready.
 
@@ -93,6 +121,14 @@ async def github_webhook(request: Request) -> Response:
         if payload.get("action") in wanted:
             _spawn_tick(request.app, payload["repository"]["full_name"],
                         _ready_seeds(payload))
+        return Response(status_code=204)
+    if event == "check_run":
+        # `created` as well as `completed`: a push restarts the suite, and the
+        # keyboard has to stop offering a merge the moment the checks it was
+        # green for are gone, not once the first of them finishes.
+        payload = json.loads(body)
+        if payload.get("action") in ("created", "completed", "rerequested"):
+            _spawn_repaint(request.app, payload)
         return Response(status_code=204)
     if event != "pull_request":
         return Response(status_code=204)

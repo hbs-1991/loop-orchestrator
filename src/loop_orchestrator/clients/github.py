@@ -161,6 +161,26 @@ class GitHubClient:
                     names.append(name)
         return names
 
+    async def behind_by(self, repo: str, base: str, head: str) -> int:
+        """Commits on `base` that `head` does not have.
+
+        GitHub reports `mergeable_state: "behind"` only while the base branch
+        carries a strict "require branches to be up to date" rule. The work
+        repos dropped it (it forced a full CI re-run on every open PR, and
+        merge queue — the cheap equivalent — is rejected with 422 on their
+        plan), so the field never arrives and the state has to be computed.
+
+        0 on any API trouble, the same best-effort stance as
+        `required_checks`: a diagnostic must never block a merge.
+        """
+        try:
+            r = await self._req("GET", f"/repos/{repo}/compare/{base}...{head}",
+                                params={"per_page": 1})
+            r.raise_for_status()
+            return int(r.json().get("behind_by") or 0)
+        except Exception:  # noqa: BLE001 — diagnostic only
+            return 0
+
     async def update_pr_branch(self, repo: str, pr_number: int) -> None:
         """GitHub-side merge of the base branch into the PR head branch."""
         r = await self._req("PUT", f"/repos/{repo}/pulls/{pr_number}/update-branch")
@@ -228,18 +248,60 @@ class GitHubClient:
                 return issues
             page += 1
 
-    async def issue_blocked_by(self, repo: str, number: int) -> list[int]:
-        """Numbers of OPEN issues this one is blocked by (native dependencies).
+    async def _dependencies(self, repo: str, number: int, rel: str) -> list[dict]:
+        """`{repo, number, state}` for one direction of the native dependencies.
 
-        Repos/plans without the dependencies feature answer 404/410 — treated
-        as "no blockers" so the scheduler keeps working.
+        Both directions are real GitHub endpoints — no fallback scan is needed:
+        `GET /repos/{repo}/issues/{n}/dependencies/blocked_by` and
+        `GET /repos/{repo}/issues/{n}/dependencies/blocking`, verified live on
+        2026-08-10, both answer 200 with a JSON array. Do not re-probe.
+
+        The blocker's own repository only appears on cross-repo links, so a
+        missing `repository` means "same repo". Repos/plans without the feature
+        answer 404/410 — treated as "none" so the scheduler keeps working.
         """
         r = await self._req("GET",
-                            f"/repos/{repo}/issues/{number}/dependencies/blocked_by")
+                            f"/repos/{repo}/issues/{number}/dependencies/{rel}")
         if r.status_code in (404, 410):
             return []
         r.raise_for_status()
-        return [i["number"] for i in r.json() if i.get("state") == "open"]
+        return [{"repo": ((i.get("repository") or {}).get("full_name") or repo),
+                 "number": i["number"],
+                 "state": i.get("state") or "open"}
+                for i in r.json()]
+
+    async def issue_dependencies(self, repo: str, number: int) -> list[dict]:
+        """Every issue this one is blocked by, open or closed."""
+        return await self._dependencies(repo, number, "blocked_by")
+
+    async def issue_blocking(self, repo: str, number: int) -> list[dict]:
+        """Every issue this one blocks — the direction the handoff needs."""
+        return await self._dependencies(repo, number, "blocking")
+
+    async def issue_blocked_by(self, repo: str, number: int) -> list[int]:
+        """Numbers of the OPEN blockers — the scheduler's launch gate."""
+        return [d["number"] for d in await self.issue_dependencies(repo, number)
+                if d["state"] == "open"]
+
+    async def find_comment(self, repo: str, number: int, marker: str) -> dict | None:
+        for c in await self.list_issue_comments(repo, number):
+            if marker in (c.get("body") or ""):
+                return c
+        return None
+
+    async def update_comment(self, repo: str, comment_id: int, body: str) -> None:
+        r = await self._req("PATCH", f"/repos/{repo}/issues/comments/{comment_id}",
+                            json={"body": body})
+        r.raise_for_status()
+
+    async def upsert_marked_comment(self, repo: str, number: int, marker: str,
+                                    body: str) -> None:
+        """One marked comment per issue — a re-run edits it instead of piling up."""
+        existing = await self.find_comment(repo, number, marker)
+        if existing is None:
+            await self.create_comment(repo, number, body)
+        else:
+            await self.update_comment(repo, int(existing["id"]), body)
 
     async def list_issue_comments(self, repo: str, number: int,
                                   since: str | None = None) -> list[dict]:

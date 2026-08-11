@@ -49,9 +49,28 @@ from 19 to 0.5.
 
 **Fix:** `Pipeline._task_status` returns `None` on `httpx.TransportError` and 5xx — the polling loop
 simply waits for the next tick, and the stage deadline remains the boundary; a 4xx still fails the Run
-(a task that does not exist will not come back). Plus the ops constraint `LOOP_MAX_CONCURRENT_RUNS=2` —
-four sandboxes at ~2 GB each do not fit into 8 GB without swap
+(a task that does not exist will not come back). Plus the ops constraint `LOOP_MAX_CONCURRENT_RUNS=2`
 ([[decisions/0009-concurrency-cap-and-poll-resilience]]).
+
+**What the numbers turned out to be (measured 2026-08-06).** A sandbox mid-stage takes a whole core
+and ~3.5 GB, while the entire control plane — orchestrator, sandboxd, traefik, caddy — takes 0.22% of
+one core together. Two Runs on two cores therefore leave dockerd exactly nothing, and the cap of 2 was
+never a safe setting on this host, only a less unsafe one. Full profile and the sizing rule are in
+[[ops/vps]].
+
+**The cap was long the only lever we had.** sandboxd set no CPU ceiling on a sandbox at all — its
+container spec hardcoded `CPUShares: 100` (a relative weight, not a limit) and no `--cpus`, and
+`MemorySwap == Memory` meant host swap never reached a sandbox ([[concepts/sandboxd-platform]]). Since
+2026-08-06 a local patch gives us both (`SANDBOXD_CPUS`, `SANDBOXD_MEMORY`, `SANDBOXD_MEMORY_SWAP` —
+[`deploy/sandboxd-patches/`](../../../deploy/sandboxd-patches/README.md)), and the host is now sized
+for its Runs ([[decisions/0012-one-bigger-host-over-a-multi-host-pool]]). The two answer different
+halves of the same failure: the ceiling stops one Run taking the last core, the sizing stops three
+Runs fighting over four.
+
+**A Run takes every core it is given.** The "one core per Run" figure was measured with two Runs
+sharing two cores. On four cores a single planner was seen at **319%** — so the sizing rule describes
+a steady state under contention, not an appetite. Without a ceiling, one Run is enough to starve the
+host; that is why the patch matters even on a bigger box.
 
 ## 4. Transient HTTP client errors
 
@@ -67,6 +86,28 @@ so `deploy.yml` now tries the ssh connection with retries (8×20 s) before deliv
 `Worker.recover()` + `_submit_resumable`/`_drain_stale_task`: if a task is running in the sandbox, it is
 waited out rather than having a second one submitted into a busy sandbox (409 → this used to mean
 `failed`, that is how Run#15 died).
+
+## 6. A dead sandbox answers 409 forever
+
+**Incident 2026-08-08.** A planning Run spent 53 minutes in `planning` without a single `run_events`
+row, a Telegram push or a submitted task — and would have spent three hours, its whole
+`timeout_minutes`. Its sandbox had died at birth: the nightly prune had deleted the sandbox image, so
+the workspace seed failed and sandboxd left the sandbox in status `error` ([[ops/vps]]).
+
+Two of our own mechanisms turned that into silence:
+
+- `create_sandbox` adopts `current_sandbox_id` on a `409`, which is right when a lost reply made
+  `with_retries` re-POST an already-created sandbox — but the retry of a **failed** creation lands on
+  the same branch, and it adopted a stillborn sandbox. It now reads the status first and refuses
+  anything in `error`.
+- `_submit_resumable` reads every `409` as "busy, wait" and retries until the stage deadline. A
+  sandbox in `error` answers `409` too and never stops; the loop now asks sandboxd for the status on a
+  conflict and fails the stage at once (`_sandbox_is_dead`). Deliberately one-sided: an unreachable
+  control plane or a version that reports no status is **not** read as death, or a Run that is merely
+  waiting would be killed.
+
+The general lesson is the one this page keeps re-learning: **a retry loop without a liveness check is
+a silent timeout**. Every state that can never resolve must be recognised, not waited out.
 
 ## The post-mortem rule
 

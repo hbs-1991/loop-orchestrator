@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     e2e_model: str = ""  # empty = the executor's default model
     planner_model: str = ""  # empty = the executor's default model
     advisor_model: str = "claude-fable-5"
+    # The contracting stage reads code it did not write and its output is
+    # planned against in another repository — a mistake here surfaces only when
+    # the consumer's implementation runs, so this is not reviewer-grade work.
+    contract_model: str = "claude-sonnet-5"
     plan_max_iterations: int = 3
     tz: str = "UTC"  # IANA zone for progress-card timestamps
     telegram_admin_ids: str = ""  # CSV of Telegram user ids allowed to press buttons
@@ -50,6 +54,16 @@ class Settings(BaseSettings):
     public_url: str = ""  # external base URL of the orchestrator (for setWebhook)
     backlog_poll_minutes: int = 5
     backlog_repos: str = ""  # CSV of owner/repo polled even before first webhook
+    # --- agent tracing (spec: docs/superpowers/specs/2026-08-06-agent-tracing-otel.md)
+    # Empty endpoint = tracing off: no session copy, no exec calls, no export.
+    # The orchestrator must run unchanged for anyone without a collector.
+    otlp_endpoint: str = ""  # e.g. http://jaeger:4318
+    trace_service_name: str = "loop-orchestrator"
+    # Cap on every exported content field. Full tool results run to megabytes of
+    # repository code and command output; a preview answers "what came back"
+    # without turning a trace into a copy of the repo.
+    trace_preview_chars: int = 500
+    model_prices: str = ""  # JSON override of tracing/pricing.py's table
 
     def admin_ids(self) -> set[int]:
         return {int(x) for x in self.telegram_admin_ids.replace(" ", "").split(",") if x}

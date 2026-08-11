@@ -8,7 +8,8 @@ import logging
 
 from . import db as dbmod
 from . import issue_tasks as it
-from .loopconfig import resolve_base_branch
+from .contracts import collect_upstreams
+from .loopconfig import planning_enabled, resolve_base_branch
 from .models import CANCELLED, DONE, FAILED
 from .planning import TASK_FILE, build_task_file
 
@@ -31,7 +32,8 @@ def lane_from_labels(labels: list) -> str | None:
     return None
 
 
-async def bootstrap(gh, repo: str, issue: dict, comments: list[dict]) -> str:
+async def bootstrap(gh, repo: str, issue: dict, comments: list[dict],
+                    upstreams: "list | tuple" = ()) -> str:
     """Ensure the issue branch exists and holds a fresh task snapshot.
 
     The branch must exist BEFORE the sandbox app is created (sandboxd cannot
@@ -44,7 +46,8 @@ async def bootstrap(gh, repo: str, issue: dict, comments: list[dict]) -> str:
         base = await resolve_base_branch(gh, repo)
         base_sha = await gh.branch_sha(repo, base)
         await gh.create_branch(repo, branch, base_sha)
-    await gh.put_file(repo, branch, TASK_FILE, build_task_file(issue, comments),
+    await gh.put_file(repo, branch, TASK_FILE,
+                      build_task_file(issue, comments, upstreams),
                       f"loop: task snapshot for issue #{number}")
     return branch
 
@@ -117,9 +120,15 @@ class Scheduler:
             elif task.state == it.RUNNING:
                 await self._resolve_running(task)
             elif task.state == it.BACKLOG:
+                # One API call answers both questions: the launch gate (open
+                # blockers only) and the handoff memory (every dependency, so
+                # the link survives the blocker closing).
+                deps = await self.gh.issue_dependencies(repo, task.issue_number)
+                await it.set_depends_on(self.db, repo, task.issue_number, [
+                    {"repo": d["repo"], "number": d["number"]} for d in deps])
                 await it.set_blocked_by(
                     self.db, repo, task.issue_number,
-                    await self.gh.issue_blocked_by(repo, task.issue_number))
+                    [d["number"] for d in deps if d["state"] == "open"])
 
     async def _check_answered(self, task: "it.IssueTask") -> None:
         comments = await self.gh.list_issue_comments(
@@ -141,19 +150,45 @@ class Scheduler:
                 await self.gh.create_comment(
                     task.repo, task.issue_number,
                     f"❌ Loop run #{run.id} failed: {run.error or 'see the PR'}")
-        elif run.kind == "pr" and run.state == DONE:
-            issue = await self.gh.get_issue(task.repo, task.issue_number)
-            if issue.get("state") == "closed":  # merge closed it via "Closes #N"
-                await it.set_state(self.db, task.repo, task.issue_number, it.DONE)
+            return
+        if run.state != DONE:
+            return  # still working
+        if run.kind == "planning":
+            # A planning run hands the issue over to the PR run its plan
+            # produced, and the mirror normally follows that handoff
+            # (webhook._link_issue_task). When the handoff is missed the mirror
+            # keeps pointing at a run that finished long ago — and since a
+            # running task holds its lane, one stale row stops every other issue
+            # in that lane forever (seen live on issue #10: the mirror kept the
+            # planning run while the PR run had already merged). Recover from
+            # the runs table rather than trusting the recorded id.
+            successor = await dbmod.latest_run_for_issue(
+                self.db, task.repo, task.issue_number, "pr")
+            if successor is not None:
+                await it.set_run(self.db, task.repo, task.issue_number, successor.id)
+                return  # the next tick judges the successor
+            # No PR run yet: the plan's PR is waiting for its loop:run label, so
+            # the task genuinely is still in flight — unless the issue is gone.
+        issue = await self.gh.get_issue(task.repo, task.issue_number)
+        if issue.get("state") == "closed":  # merge closed it via "Closes #N"
+            await it.set_state(self.db, task.repo, task.issue_number, it.DONE)
 
     async def _launch_ready(self, repo: str) -> None:
         tasks = await it.tasks_for_repo(self.db, repo)
         backlog = [t for t in tasks if t.state == it.BACKLOG and not t.blocked_by]
         running = [t for t in tasks if t.state == it.RUNNING]
-        for task in pick_candidates(backlog, running):
+        candidates = pick_candidates(backlog, running)
+        # Asked only when there is something to launch: a repository whose
+        # backlog is empty (the common tick) costs no extra GitHub calls.
+        if candidates and not await planning_enabled(self.gh, repo):
+            log.debug("planning disabled by .loop.yml for %s; %d task(s) left "
+                      "in the backlog", repo, len(candidates))
+            return
+        for task in candidates:
             issue = await self.gh.get_issue(repo, task.issue_number)
             comments = await self.gh.list_issue_comments(repo, task.issue_number)
-            branch = await bootstrap(self.gh, repo, issue, comments)
+            upstreams = await collect_upstreams(self.db, self.gh, task)
+            branch = await bootstrap(self.gh, repo, issue, comments, upstreams)
             run = await dbmod.create_planning_run(
                 self.db, repo, task.issue_number, branch, task.title, task.lane)
             await it.set_run(self.db, repo, task.issue_number, run.id)

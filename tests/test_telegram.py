@@ -7,6 +7,7 @@ from loop_orchestrator.clients.telegram import (
     TelegramNotifier,
     approve_kb,
     cancel_kb,
+    gate_kb,
     merge_kb,
     restart_kb,
 )
@@ -22,6 +23,57 @@ def mock_rich_unsupported():
     """Bot API without sendRichMessage (or a rejected markdown) -> 404/400."""
     return respx.post("https://api.telegram.org/botTOK/sendRichMessage").mock(
         return_value=httpx.Response(404, json={"ok": False}))
+
+
+def test_gate_kb_offers_merge_only_when_the_merge_would_be_accepted():
+    """Telegram has no disabled button, so a state the gate would refuse shows
+    what is missing instead of a button that only answers "not yet"."""
+    def codes(kb):
+        return [b["callback_data"].split(":")[0]
+                for row in kb["inline_keyboard"] for b in row]
+
+    assert codes(gate_kb(7, "clean", [], 3, 3)) == ["mg", "md"]
+    assert codes(gate_kb(7, "checks_pending", [], 2, 3)) == ["ck"]
+    assert codes(gate_kb(7, "checks_failed", ["image"], 3, 3)) == ["ck"]
+    assert codes(gate_kb(7, "behind", [])) == ["ub"]
+    # Pressing through a conflict really does resolve and then merge.
+    assert codes(gate_kb(7, "conflicts", [])) == ["mg"]
+
+    def label(kb):
+        return kb["inline_keyboard"][0][0]["text"]
+
+    assert label(gate_kb(7, "checks_pending", [], 2, 3)) == "⏳ CI 2/3"
+    assert label(gate_kb(7, "checks_failed", ["image", "gates"], 3, 3)) == \
+        "🔴 CI red: image, gates"
+    # No ruleset to count against: say it is running rather than lie with 0/0.
+    assert label(gate_kb(7, "checks_pending", [], 0, 0)) == "⏳ CI running"
+
+
+@respx.mock
+async def test_notify_done_returns_the_message_id_it_must_repaint_later():
+    respx.post("https://api.telegram.org/botTOK/sendRichMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True,
+                                               "result": {"message_id": 909}}))
+    assert await TelegramNotifier("TOK", 42).notify_done(make_run()) == 909
+
+
+@respx.mock
+async def test_notify_done_id_is_none_when_the_rich_path_fell_back():
+    # The fallback goes through sendMessage, whose id we do not capture: the
+    # caller must treat None as "this keyboard will simply not be updated".
+    mock_rich_unsupported()
+    respx.post("https://api.telegram.org/botTOK/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True,
+                                               "result": {"message_id": 5}}))
+    assert await TelegramNotifier("TOK", 42).notify_done(make_run()) is None
+
+
+@respx.mock
+async def test_set_buttons_treats_not_modified_as_success():
+    route = respx.post("https://api.telegram.org/botTOK/editMessageReplyMarkup").mock(
+        return_value=httpx.Response(400, text="Bad Request: message is not modified"))
+    await TelegramNotifier("TOK", 42).set_buttons(909, merge_kb(7))
+    assert route.call_count == 1
 
 
 @respx.mock
@@ -509,3 +561,38 @@ async def test_set_webhook():
 async def test_set_webhook_swallows_errors():
     respx.post("https://api.telegram.org/bottok/setWebhook").respond(400)
     await TelegramNotifier("tok", 42).set_webhook("https://x/y", "s")
+
+
+def test_status_lines_report_the_contract():
+    tg = TelegramNotifier("TOK", 1)
+    run = make_run()
+    run.contract_enabled = True
+    run.contract_status = "produced"
+    assert "Contract: 📄 captured" in tg._status_lines(run)
+
+    run.contract_status = "failed"
+    assert "Contract: ⚠️" in tg._status_lines(run)
+
+    run.contract_status = "skipped"
+    assert "Contract" not in tg._status_lines(run)
+
+
+@respx.mock
+async def test_approval_message_carries_the_contract_text():
+    # The human approves before the issue comment exists, so the contract has
+    # to travel in the message itself.
+    route = respx.post("https://api.telegram.org/botTOK/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True,
+                                               "result": {"message_id": 42}}))
+    tg = TelegramNotifier("TOK", 1)
+    run = make_run()
+    run.state = "awaiting_approval"
+    run.contract_enabled = True
+    run.contract_status = "produced"
+    run.contract_json = json.dumps({"outcome": "contract",
+                                    "contract": "### POST /v1/ingest",
+                                    "sources": ["src/api/ingest.py"],
+                                    "breaking_changes": []})
+    assert await tg.notify_awaiting_approval(run) == 42
+    text = json.loads(route.calls[0].request.read())["text"]
+    assert "POST /v1/ingest" in text

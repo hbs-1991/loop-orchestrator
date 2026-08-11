@@ -44,6 +44,41 @@ The Merge button (and Merge & Deploy) first reads readiness — `Actions._merge_
 The clone inside the sandbox has **no** credentials, so `git fetch` does not work there — hence the
 temporary token for the resolver agent (verified, 2026-08-05).
 
+### What a clean merge still hides
+
+Green check runs are a weaker signal than they look, and the resolver prompt now says so. Two branches
+that each added "the next" sequentially numbered artefact — a database migration, a numbered decision
+record — end up with **different filenames**, so git merges them without a marker while the result is
+broken: a forked migration graph, two documents claiming one number. No CI job runs migrations, so the
+gate above sees green and merges it. `build_sync_prompt` makes the resolver hunt for that class after
+the merge (one head, renumber its own side, re-derive lockfiles with their tool, take `.loop/` from the
+base, run the repo's own checks on the merged tree).
+
+**Staleness is computed, not trusted** (2026-08-07). `mergeable_state == "behind"` arrives only while the
+base carries a strict "up to date" rule; the work repos dropped it, so a stale branch reads as `clean`.
+`_merge_readiness` therefore asks `compare/{base}...{head}` for `behind_by` and reuses the existing
+`behind` branch — `> 0` updates the branch and waits for the re-run, `== 0` merges on the first press
+(an empty merge commit is itself a push worth a full CI run). The check sits immediately before the
+merge, so the window in which a rival can land is seconds wide.
+
+**The promote path does not run on the merge event.** `promote-staging.yml` triggers on
+`workflow_run: workflows: ["ci"], branches: [main], types: [completed]` and runs only when that run
+concluded `success`; it promotes `workflow_run.head_sha`. So our button's chain is merge → `ci` on
+`main` → success → promote, and the workflow's own "no successful `ci` run" guard is a second belt on
+a path that already satisfies it. The failure seen on 2026-08-06 was the `workflow_dispatch` branch of
+the same workflow, where the target is whatever `main` points at right now — freshly merged, `ci` still
+running. **Load-bearing consequence:** the merge must not be made with an Actions `GITHUB_TOKEN`, or no
+`ci` run starts on `main` and the promotion never fires. The orchestrator merges with its own PAT, which
+is what keeps this working — do not "simplify" that token.
+
+**Detector and preventer are different halves.** Freshness alone does not stop a forked migration graph —
+a PR that is current when checked still forks it if a rival merges afterwards. The backend `gates` job
+now checks "exactly one head" and unique decision numbers, but on a PR it runs against the merge-ref
+where the head is honestly single: it fires on `push: main`, *after* both sides merged. That protects the
+rollout (promote-staging refuses a commit without a green `ci`) without protecting `main`. The two halves
+compose: `behind_by > 0` → update-branch → both migrations sit in one tree **before** the merge → the
+gate reddens the PR instead of `main`. Neither half does that alone.
+
 ## Promotion to staging
 
 The `🚀 Merge & Deploy` button puts `LOOP_PROMOTE_LABEL` (default `promote:staging`) on the PR **before**

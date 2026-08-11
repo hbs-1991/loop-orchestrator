@@ -28,6 +28,14 @@ class LoopConfig:
     e2e_env: dict[str, str] = field(default_factory=dict)
     e2e_services: bool = False
     approval: str = "always"  # always | never — pause before publishing
+    # Planning is the one stage a repository may switch off entirely: it is
+    # opt-out rather than opt-in, because a backlog issue with no plan has
+    # nowhere else to get one. `None` on a model means "whatever LOOP_* says".
+    planning_enabled: bool = True
+    planner_model: str | None = None
+    advisor_enabled: bool = True
+    advisor_model: str | None = None
+    plan_max_iterations: int | None = None
 
 
 def parse_loop_config(text: str) -> LoopConfig:
@@ -84,6 +92,36 @@ def parse_loop_config(text: str) -> LoopConfig:
     if approval not in ("always", "never"):
         raise LoopConfigError("approval must be 'always' or 'never'")
 
+    planning = data.get("planning")
+    if planning is not None and not isinstance(planning, dict):
+        raise LoopConfigError("planning must be a mapping")
+    planning = planning or {}
+    advisor = planning.get("advisor")
+    if advisor is not None and not isinstance(advisor, dict):
+        raise LoopConfigError("planning.advisor must be a mapping")
+    advisor = advisor or {}
+
+    def flag(section: dict, path: str, key: str = "enabled") -> bool:
+        v = section.get(key, True)
+        if not isinstance(v, bool):
+            raise LoopConfigError(f"{path} must be a boolean")
+        return v
+
+    def model(section: dict, path: str) -> str | None:
+        v = section.get("model")
+        if v is None:
+            return None
+        if not isinstance(v, str) or not v.strip():
+            raise LoopConfigError(f"{path} must be a non-empty string")
+        return v.strip()
+
+    plan_iterations = advisor.get("max_iterations")
+    if plan_iterations is not None and (not isinstance(plan_iterations, int)
+                                        or isinstance(plan_iterations, bool)
+                                        or plan_iterations < 0):
+        raise LoopConfigError(
+            "planning.advisor.max_iterations must be an integer >= 0")
+
     base_branch = opt_str("base_branch")
     if base_branch is not None and not base_branch.strip():
         raise LoopConfigError("base_branch must not be empty")
@@ -104,6 +142,11 @@ def parse_loop_config(text: str) -> LoopConfig:
         e2e_env=e2e_env,
         e2e_services=e2e.get("services") is not None,
         approval=approval,
+        planning_enabled=flag(planning, "planning.enabled"),
+        planner_model=model(planning, "planning.model"),
+        advisor_enabled=flag(advisor, "planning.advisor.enabled"),
+        advisor_model=model(advisor, "planning.advisor.model"),
+        plan_max_iterations=plan_iterations,
     )
 
 
@@ -127,6 +170,31 @@ async def resolve_base_branch(gh, repo: str) -> str:
         return parse_loop_config(raw).base_branch or default
     except LoopConfigError:
         return default
+
+
+async def planning_enabled(gh, repo: str) -> bool:
+    """Whether the scheduler may open a planning Run for this repository.
+
+    Read from the DEFAULT branch, like `resolve_base_branch` and for the same
+    reason: the decision is taken before the issue branch exists, so there is
+    nowhere else to read it from.
+
+    Fail-safe **on**: no config, an unreadable one or a broken one means the
+    repository is planned as it always was. A repository that means to switch
+    planning off says so in a `.loop.yml` that parses; anything else is a
+    fetch that failed, and a failed fetch must not silently stop a backlog.
+    """
+    try:
+        default = await gh.get_repo_default_branch(repo)
+        raw = await gh.get_file(repo, default, ".loop.yml")
+    except Exception:  # noqa: BLE001 — GitHub blip, not a policy statement
+        return True
+    if raw is None:
+        return True
+    try:
+        return parse_loop_config(raw).planning_enabled
+    except LoopConfigError:
+        return True
 
 
 def plans_dir(specs_dir: str) -> str:

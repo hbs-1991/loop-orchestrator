@@ -8,7 +8,7 @@ from fastapi import FastAPI
 
 from loop_orchestrator import db as dbmod
 from loop_orchestrator import issue_tasks as it
-from loop_orchestrator.models import ACTIVE_STATES, QUEUED
+from loop_orchestrator.models import ACTIVE_STATES, DONE, QUEUED
 from loop_orchestrator.webhook import router, verify_signature
 
 SECRET = "whsec"
@@ -17,9 +17,13 @@ SECRET = "whsec"
 class FakeWorker:
     def __init__(self):
         self.enqueued: list[int] = []
+        self.repainted: list[int] = []
 
     def enqueue(self, run_id: int) -> None:
         self.enqueued.append(run_id)
+
+    async def repaint_merge_buttons(self, run) -> None:
+        self.repainted.append(run.id)
 
 
 class FakeTG:
@@ -42,6 +46,16 @@ async def make_app(tmp_path):
     app.state.worker = FakeWorker()
     app.state.tg = FakeTG()
     return app
+
+
+async def drain_tasks(app):
+    """Wait out the detached tasks the endpoint spawned."""
+    for _ in range(10):
+        tasks = list(getattr(app.state, "tick_tasks", ()) or ())
+        if not tasks:
+            break
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
 
 
 def sign(body: bytes) -> str:
@@ -141,6 +155,71 @@ class FakeScheduler:
     async def tick(self, repo: str, seed_issues: list[dict] | None = None) -> None:
         self.ticks.append(repo)
         self.seeds.append(seed_issues or [])
+
+
+def check_run_payload(action="completed", pr_numbers=(5,)):
+    return json.dumps({
+        "action": action,
+        "check_run": {"name": "gates", "status": "completed",
+                      "pull_requests": [{"number": n} for n in pr_numbers]},
+        "repository": {"full_name": "o/r"},
+    }).encode()
+
+
+async def make_finished_run(db, pr_number=5, message_id=909):
+    run = await dbmod.create_run(db, "o/r", pr_number, "feat/x")
+    run.state = DONE
+    run.tg_merge_message_id = message_id
+    await dbmod.save_run(db, run)
+    return run
+
+
+async def test_check_run_repaints_the_merge_keyboard(tmp_path):
+    """The webhook is what makes the buttons follow CI promptly; the reaper
+    sweep behind it only covers deliveries that never arrived."""
+    app = await make_app(tmp_path)
+    run = await make_finished_run(app.state.db)
+    body = check_run_payload()
+    r = await post(app, body, sign(body), event="check_run")
+    assert r.status_code == 204
+    await drain_tasks(app)
+    assert app.state.worker.repainted == [run.id]
+
+
+async def test_check_run_created_repaints_too(tmp_path):
+    # A push restarts the suite: the keyboard must stop offering a merge as
+    # soon as the checks it was green for are gone.
+    app = await make_app(tmp_path)
+    run = await make_finished_run(app.state.db)
+    body = check_run_payload(action="created")
+    await post(app, body, sign(body), event="check_run")
+    await drain_tasks(app)
+    assert app.state.worker.repainted == [run.id]
+
+
+async def test_check_run_without_a_repaintable_run_is_ignored(tmp_path):
+    app = await make_app(tmp_path)
+    # Merged, and a different PR — neither has a keyboard worth following.
+    merged = await make_finished_run(app.state.db, pr_number=5)
+    merged.merged_at = "2026-08-08 10:00:00"
+    await dbmod.save_run(app.state.db, merged)
+    await make_finished_run(app.state.db, pr_number=6, message_id=910)
+
+    body = check_run_payload(pr_numbers=(5,))
+    await post(app, body, sign(body), event="check_run")
+    await drain_tasks(app)
+    assert app.state.worker.repainted == []
+
+
+async def test_check_run_on_a_branch_with_no_pr_is_ignored(tmp_path):
+    # A push to main carries an empty `pull_requests` array.
+    app = await make_app(tmp_path)
+    await make_finished_run(app.state.db)
+    body = check_run_payload(pr_numbers=())
+    r = await post(app, body, sign(body), event="check_run")
+    assert r.status_code == 204
+    await drain_tasks(app)
+    assert app.state.worker.repainted == []
 
 
 async def test_issue_labeled_triggers_scheduler_tick(tmp_path):

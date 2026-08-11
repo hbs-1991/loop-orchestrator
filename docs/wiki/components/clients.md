@@ -27,6 +27,10 @@ A thin wrapper over the platform API; all of its weirdness is described in
 
 - `keepalive` hits the **internal** surface `POST /sandbox/{id}/keepalive` (no `/v1`) and swallows
   errors best-effort;
+- `exec_cmd` runs a command **without the agent** — same internal surface, `POST /sandbox/{id}/exec`.
+  A non-zero `exit_code` is a normal answer, only transport/HTTP failures raise. sandboxd passes
+  neither `-u` nor `-w` to `docker exec`, so `cd` into the app directory yourself; it does bump
+  `last_active_at`, so a loop built on it needs no keepalive;
 - `start_sandbox` brings up a container the reaper stopped;
 - `create_sandbox` on a 409 adopts the app's `current_sandbox_id`;
 - `put_file` is the secrets delivery channel;

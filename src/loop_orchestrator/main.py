@@ -32,6 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                           worker=worker, pipeline=pipeline)
         scheduler = Scheduler(db=db, settings=resolved, gh=gh, worker=worker)
         worker.scheduler = scheduler
+        worker.actions = actions
         app.state.db, app.state.worker, app.state.tg = db, worker, tg
         app.state.actions = actions
         app.state.scheduler = scheduler

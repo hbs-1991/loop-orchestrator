@@ -22,12 +22,17 @@ class FakeGitHub:
         self.pr_info: dict = {"mergeable": True, "mergeable_state": "clean",
                               "base": {"ref": "main"}}
         self.branch_updates: list[int] = []
+        self.behind = 0                             # commits base has, head lacks
+        self.compares: list[tuple[str, str]] = []
         self.check_runs: list[dict] = []
         self.required_check_names: list[str] = []  # ruleset on the base branch
         self.default_branch = "main"
         self.ready_issues: list[dict] = []          # list_ready_issues response
         self.issues: dict[int, dict] = {}           # get_issue responses
-        self.blocked: dict[int, list[int]] = {}     # issue_blocked_by responses
+        self.blocked: dict[int, list[int]] = {}     # issue -> open blocker numbers
+        self.deps: dict[int, list[dict]] = {}       # issue -> dependency records
+        self.blocking: dict[int, list[dict]] = {}   # issue -> issues it blocks
+        self.comments_updated: list[tuple[int, str]] = []
         self.issue_comments: dict[int, list[dict]] = {}
         self.branches_created: list[tuple[str, str]] = []
         self.files_put: list[tuple[str, str, str]] = []  # (branch, path, content)
@@ -75,6 +80,10 @@ class FakeGitHub:
     async def update_pr_branch(self, repo, pr_number):
         self.branch_updates.append(pr_number)
 
+    async def behind_by(self, repo, base, head):
+        self.compares.append((base, head))
+        return self.behind
+
     async def list_check_runs(self, repo, sha):
         return self.check_runs
 
@@ -103,7 +112,34 @@ class FakeGitHub:
         return self.ready_issues
 
     async def issue_blocked_by(self, repo, number):
+        if number in self.deps:
+            return [d["number"] for d in self.deps[number] if d["state"] == "open"]
         return self.blocked.get(number, [])
+
+    async def issue_dependencies(self, repo, number):
+        if number in self.deps:
+            return self.deps[number]
+        return [{"repo": repo, "number": n, "state": "open"}
+                for n in self.blocked.get(number, [])]
+
+    async def issue_blocking(self, repo, number):
+        return self.blocking.get(number, [])
+
+    async def find_comment(self, repo, number, marker):
+        for c in self.issue_comments.get(number, []):
+            if marker in (c.get("body") or ""):
+                return c
+        return None
+
+    async def update_comment(self, repo, comment_id, body):
+        self.comments_updated.append((comment_id, body))
+
+    async def upsert_marked_comment(self, repo, number, marker, body):
+        existing = await self.find_comment(repo, number, marker)
+        if existing is None:
+            await self.create_comment(repo, number, body)
+        else:
+            await self.update_comment(repo, int(existing["id"]), body)
 
     async def list_issue_comments(self, repo, number, since=None):
         return self.issue_comments.get(number, [])
@@ -130,7 +166,14 @@ class FakeSandboxd:
         self.sandbox_info = {"preview": {"url": "https://s-x-3000.preview.test",
                                          "port": 3000}}
         self.keepalives: list[tuple[str, int]] = []
+        self.execs: list[dict] = []            # exec_cmd calls, in order
+        self.exec_results: list[dict] = []     # queue, consumed first
+        self.exec_default = {"stdout": "", "stderr": "", "exit_code": 0}
         self.started: list[str] = []           # sandboxes woken from 'stopped'
+        self.stopped: list[str] = []           # sandboxes slept for a pause
+        self.stop_ok = True                    # False = sandboxd refuses the stop
+        self.manifests_validated: list[str] = []
+        self.manifest_errors: list[str] = []   # what validate_manifest reports
         self.sanitized: list[str] = []         # pre-push git config cleanups
         self.unsafe_git_keys: list[str] = []   # what the cleanup found
         self.files_written: list[tuple[str, str, str]] = []  # (sandbox, path, content)
@@ -157,17 +200,35 @@ class FakeSandboxd:
     async def keepalive(self, sandbox_id, minutes):
         self.keepalives.append((sandbox_id, minutes))
 
+    async def exec_cmd(self, sandbox_id, cmd, timeout_s=60.0):
+        self.execs.append({"sandbox_id": sandbox_id, "cmd": cmd})
+        if self.exec_results:
+            return self.exec_results.pop(0)
+        return dict(self.exec_default)
+
     async def start_sandbox(self, sandbox_id):
         self.started.append(sandbox_id)
         self.sandbox_info = {**self.sandbox_info, "status": "running"}
         return True
+
+    async def stop_sandbox(self, sandbox_id):
+        if not self.stop_ok:
+            return False
+        self.stopped.append(sandbox_id)
+        self.sandbox_info = {**self.sandbox_info, "status": "stopped"}
+        return True
+
+    async def validate_manifest(self, raw):
+        self.manifests_validated.append(raw)
+        return list(self.manifest_errors)
 
     async def put_file(self, sandbox_id, path, content):
         if self.put_file_error is not None:
             raise self.put_file_error
         self.files_written.append((sandbox_id, path, content))
 
-    async def submit_task(self, sandbox_id, prompt, timeout_s, continue_session=False, model=None):
+    async def submit_task(self, sandbox_id, prompt, timeout_s, continue_session=None,
+                          model=None):
         if self.submit_conflicts > 0:
             self.submit_conflicts -= 1
             req = httpx.Request("POST", f"http://sb/v1/sandboxes/{sandbox_id}/tasks")
@@ -218,6 +279,7 @@ class FakeTG:
         self.video_error: Exception | None = None
         self.card_states: list[str] = []
         self.thread_finished = False
+        self.buttons: list[tuple[int, dict]] = []
 
     async def send(self, text, thread_id=None):
         self.sent.append(text)
@@ -238,6 +300,10 @@ class FakeTG:
 
     async def notify_done(self, run):
         self.sent.append(f"done:{run.id}")
+        return 909                              # the merge message's id
+
+    async def set_buttons(self, message_id, markup):
+        self.buttons.append((message_id, markup))
 
     async def notify_failed(self, run):
         self.sent.append(f"failed:{run.id}")
@@ -295,7 +361,14 @@ class FakeSettings:
     backlog_repos = ""
     planner_model = ""
     advisor_model = "claude-fable-5"
+    contract_model = "claude-sonnet-5"
     plan_max_iterations = 3
+    # Tracing off by default here too, so every existing test keeps asserting on
+    # a pipeline that makes no tracing calls at all.
+    otlp_endpoint = ""
+    trace_service_name = "loop-orchestrator-test"
+    trace_preview_chars = 500
+    model_prices = ""
 
     def admin_ids(self):
         return {1}

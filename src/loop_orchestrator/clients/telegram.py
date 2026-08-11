@@ -1,4 +1,5 @@
 import html
+import json
 import logging
 
 import httpx
@@ -36,6 +37,33 @@ def merge_kb(run_id: int) -> dict:
     ]]}
 
 
+def gate_kb(run_id: int, state: str, red: list[str] | None = None,
+            done: int = 0, total: int = 0) -> dict:
+    """The merge keyboard as an indicator of what the gate currently sees.
+
+    Telegram has no disabled button, so a merge button that would only be
+    refused is not shown at all — the row says what is missing instead. Since
+    the target repos' CI moved to a two-slot self-hosted pool the wait is long
+    enough that a blind press was the normal way to use these buttons.
+    """
+    if state == "clean":
+        return merge_kb(run_id)
+    if state == "conflicts":
+        # Pressing this really does resolve and then merge, so `mg` is honest.
+        return {"inline_keyboard": [[
+            {"text": "🔧 Resolve & merge", "callback_data": f"mg:{run_id}"}]]}
+    if state == "behind":
+        return {"inline_keyboard": [[
+            {"text": "⤴️ Update branch", "callback_data": f"ub:{run_id}"}]]}
+    if state == "checks_failed":
+        names = ", ".join(red or [])[:40] or "?"
+        return {"inline_keyboard": [[
+            {"text": f"🔴 CI red: {names}", "callback_data": f"ck:{run_id}"}]]}
+    progress = f"{done}/{total}" if total else "running"
+    return {"inline_keyboard": [[
+        {"text": f"⏳ CI {progress}", "callback_data": f"ck:{run_id}"}]]}
+
+
 def restart_kb(run_id: int) -> dict:
     return {"inline_keyboard": [[{"text": "🔁 Restart", "callback_data": f"rs:{run_id}"}]]}
 
@@ -69,10 +97,18 @@ class TelegramNotifier:
 
     async def send_rich_markdown(self, markdown: str, fallback_html: str,
                                  thread_id: int | None = None,
-                                 reply_markup: dict | None = None) -> None:
+                                 reply_markup: dict | None = None) -> int | None:
         """Bot API 10.x rich message: Telegram renders raw markdown natively
         (tables included) — no entity conversion on our side. Falls back to the
-        parse_mode=HTML path when the API rejects it or does not support it."""
+        parse_mode=HTML path when the API rejects it or does not support it.
+
+        Returns the message_id when the API reported one — the caller keeps it
+        to repaint the keyboard later. None is not an error: the fallback path
+        and a malformed response both land there, and every caller treats a
+        missing id as "this message simply will not be updated".
+        """
+        sent: dict = {}
+
         async def call() -> None:
             payload = _with_thread({
                 "chat_id": self.chat_id,
@@ -82,13 +118,18 @@ class TelegramNotifier:
                 payload["reply_markup"] = reply_markup
             r = await self._http.post("/sendRichMessage", json=payload)
             r.raise_for_status()
-            if not r.json().get("ok", True):
+            body = r.json()
+            if not body.get("ok", True):
                 raise RuntimeError("sendRichMessage returned ok=false")
+            sent["id"] = (body.get("result") or {}).get("message_id")
         try:
             await with_retries(call)
         except Exception:
             await self.send(fallback_html, thread_id=thread_id,
                             reply_markup=reply_markup)
+            return None
+        mid = sent.get("id")
+        return int(mid) if isinstance(mid, int) else None
 
     async def send_video(self, video: bytes, filename: str, caption: str,
                          thread_id: int | None = None) -> None:
@@ -190,9 +231,35 @@ class TelegramNotifier:
             e2e_line = "E2E: ⚠️ failures remain — see the PR comment\n"
         elif run.e2e_status == "skipped":
             e2e_line = "E2E: ⛔ skipped (see the PR note)\n"
-        return review_line + e2e_line
+        contract_line = ""
+        if run.contract_status == "produced":
+            contract_line = "Contract: 📄 captured for the tasks this one blocks\n"
+        elif run.contract_status == "none":
+            contract_line = "Contract: 📄 no external interface changed\n"
+        elif run.contract_status == "failed":
+            contract_line = "Contract: ⚠️ not captured — dependent tasks will ask\n"
+        return review_line + e2e_line + contract_line
 
-    async def notify_done(self, run: Run) -> None:
+    def _contract_block(self, run: Run) -> str:
+        """The captured contract, for the one message a human answers.
+
+        The issue comment does not exist yet at this point — it is published
+        after approve — so rejecting a wrong contract is only possible if the
+        text travels here.
+        """
+        if run.contract_status != "produced" or not run.contract_json:
+            return ""
+        try:
+            data = json.loads(run.contract_json)
+        except ValueError:
+            return ""
+        body = (data.get("contract") or "")[:1200]
+        if not body:
+            return ""
+        return ("\n📄 <b>API contract for dependent tasks</b>"
+                f"<blockquote expandable>{md_to_telegram_html(body)}</blockquote>")
+
+    async def notify_done(self, run: Run) -> int | None:
         status_lines = self._status_lines(run)
         t = run_title(run)
         summary_md = (run.summary or "(no summary)")[:3200]
@@ -205,9 +272,12 @@ class TelegramNotifier:
             # Rich version would be cut mid-tag by Telegram's 4096 limit —
             # fall back to plain escaped text, which survives any truncation.
             text = f"{head}\n{html.escape(run.summary or '')[:3400]}"
-        await self.send_rich_markdown(markdown, fallback_html=text,
-                                      thread_id=run.tg_thread_id,
-                                      reply_markup=merge_kb(run.id))
+        # The id goes into the run so the reaper can repaint these buttons as
+        # the PR's checks move; the initial keyboard is deliberately the plain
+        # merge pair, because at this moment the gate has not been read yet.
+        return await self.send_rich_markdown(markdown, fallback_html=text,
+                                             thread_id=run.tg_thread_id,
+                                             reply_markup=merge_kb(run.id))
 
     async def notify_review_escalation(self, run: Run, remaining: int) -> None:
         t = run_title(run)
@@ -241,13 +311,18 @@ class TelegramNotifier:
     async def notify_awaiting_approval(self, run: Run) -> int | None:
         """Pushing approval request with buttons; returns its message_id."""
         t = run_title(run)
-        preview_line = (f'🔗 <a href="{run.preview_url}">preview</a>\n'
+        # The paused sandbox is stopped, and the first hit on the link wakes it
+        # (~10 s, and it can answer 502 while the server binds). Saying so beats
+        # a reviewer reading that 502 as a broken build.
+        preview_line = (f'🔗 <a href="{run.preview_url}">preview</a> '
+                        "<i>(asleep — first open takes ~10 s, reload if it 502s)</i>\n"
                         if run.preview_url else "🔗 preview unavailable\n")
         head = (f"⏸ <b>{html.escape(t)}</b> — awaiting approval\n"
                 f"{self._sub_html(run)}\n{self._status_lines(run)}{preview_line}")
         summary_md = (run.summary or "(no summary)")[:3200]
         text = (f"{head}<blockquote expandable>{md_to_telegram_html(summary_md)}"
-                f"</blockquote>\nReply to this message to request changes.")
+                f"</blockquote>{self._contract_block(run)}\n"
+                "Reply to this message to request changes.")
         if len(text) > 4000:
             text = (f"{head}\n{html.escape(run.summary or '')[:3200]}\n"
                     "Reply to this message to request changes.")
@@ -281,6 +356,20 @@ class TelegramNotifier:
                 "callback_query_id": callback_id, "text": text[:200]})
         except Exception:
             log.warning("answerCallbackQuery failed", exc_info=True)
+
+    async def set_buttons(self, message_id: int, markup: dict) -> None:
+        """Repaint one message's keyboard. "not modified" is the expected reply
+        whenever the gate state has not moved, so it is not logged as trouble."""
+        try:
+            r = await self._http.post("/editMessageReplyMarkup", json={
+                "chat_id": self.chat_id, "message_id": message_id,
+                "reply_markup": markup})
+            if r.status_code == 400 and "not modified" in r.text:
+                return
+            r.raise_for_status()
+        except Exception:
+            log.warning("set_buttons failed for message=%s", message_id,
+                        exc_info=True)
 
     async def clear_buttons(self, message_id: int) -> None:
         try:

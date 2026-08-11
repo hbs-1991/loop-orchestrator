@@ -80,10 +80,22 @@ e2e:
   max_fix_iterations: 2
   env:
     PLAYWRIGHT_REUSE_SERVER: "1"
+planning:
+  enabled: true              # false = the loop never plans for this repo; write plans yourself
+  model: claude-opus-5       # optional; default = the orchestrator's LOOP_PLANNER_MODEL
+  advisor:
+    enabled: true            # false = publish the first plan, with no review round
+    model: claude-fable-5    # optional; default = LOOP_ADVISOR_MODEL
+    max_iterations: 3        # how many times the planner may be sent back to rewrite
 ```
 
 `required_env` names secrets; their values are read from a per-repository file on the orchestrator
 host and delivered into the sandbox as `.loop/secrets.env`, never through the prompt.
+
+Every section is optional and every default keeps the previous behaviour, so an existing `.loop.yml`
+needs no edit. `planning.enabled` is the one switch read from the repository's **default** branch —
+the decision is taken before the issue branch exists — and a missing or unparseable config leaves
+planning on rather than silently stalling a backlog.
 
 ## Run states
 
@@ -127,6 +139,13 @@ python -m pytest tests -v
 
 The tests are self-contained: HTTP is mocked with respx, the webhook is driven through an ASGI
 transport, and no sandbox, GitHub account or Telegram bot is required.
+
+## Contributing
+
+Contributions are welcome — read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. It covers the workflow
+(a design before a diff), the rules a pull request is checked against, and the short list of things
+that look wrong and are not: each one is a workaround for a verified platform constraint that has
+already been re-discovered more than once.
 
 ## Status and honest limitations
 

@@ -2,6 +2,7 @@ import json
 import time
 
 import httpx
+import pytest
 import respx
 
 from loop_orchestrator.clients.sandboxd import SandboxdClient
@@ -46,8 +47,54 @@ async def test_create_sandbox_adopts_existing_on_409():
     respx.get(f"{SB}/v1/apps/app1").mock(
         return_value=httpx.Response(200, json={
             "id": "app1", "current_sandbox_id": "sb-existing"}))
+    respx.get(f"{SB}/v1/sandboxes/sb-existing").mock(
+        return_value=httpx.Response(200, json={"id": "sb-existing",
+                                               "status": "running"}))
     c = make_client()
     assert await c.create_sandbox("app1") == "sb-existing"
+
+
+@respx.mock
+async def test_create_sandbox_refuses_to_adopt_a_sandbox_in_error():
+    # Run #57: the workspace seed failed (the sandbox image had been pruned off
+    # the host), leaving the row in `error`; with_retries re-POSTed the 500 and
+    # got 409. Adopting that sandbox handed the run one that answered 409 to
+    # every task for three hours — failing here is the cheaper answer.
+    respx.post(f"{SB}/v1/apps/app1/sandbox").mock(
+        return_value=httpx.Response(409, json={"error": "sandbox exists"}))
+    respx.get(f"{SB}/v1/apps/app1").mock(
+        return_value=httpx.Response(200, json={
+            "id": "app1", "current_sandbox_id": "sb-dead"}))
+    respx.get(f"{SB}/v1/sandboxes/sb-dead").mock(
+        return_value=httpx.Response(200, json={"id": "sb-dead", "status": "error"}))
+    c = make_client()
+    with pytest.raises(httpx.HTTPStatusError):
+        await c.create_sandbox("app1")
+
+
+@respx.mock
+async def test_stop_sandbox_is_best_effort():
+    respx.post(f"{SB}/v1/sandboxes/sb1/stop").mock(
+        return_value=httpx.Response(200, json={"id": "sb1", "status": "stopped"}))
+    # 409 = "a task is in progress" — sandboxd guards a working agent for us.
+    respx.post(f"{SB}/v1/sandboxes/sb2/stop").mock(
+        return_value=httpx.Response(409, json={"error": "task_in_progress"}))
+    c = make_client()
+    assert await c.stop_sandbox("sb1") is True
+    assert await c.stop_sandbox("sb2") is False
+
+
+@respx.mock
+async def test_validate_manifest_reports_errors_and_tolerates_an_outage():
+    route = respx.post(f"{SB}/v1/runtime/manifest/validate").mock(
+        return_value=httpx.Response(200, json={"errors": ["web.port is missing"],
+                                               "warnings": []}))
+    c = make_client()
+    assert await c.validate_manifest("version: 1\n") == ["web.port is missing"]
+    assert json.loads(route.calls[0].request.content)["manifest"] == "version: 1\n"
+    # Unreachable validator: a pre-flight check, not a gate.
+    route.mock(return_value=httpx.Response(500))
+    assert await c.validate_manifest("version: 1\n") == []
 
 
 @respx.mock
@@ -79,6 +126,25 @@ async def test_submit_task_continue():
         return_value=httpx.Response(200, json={"id": "t2"}))
     await make_client().submit_task("sb1", "continue", timeout_s=60, continue_session=True)
     assert json.loads(route.calls[0].request.content)["continue"] is True
+
+
+@respx.mock
+async def test_submit_task_forces_a_fresh_session():
+    # False must reach the wire: sandboxd's `continue` is tri-state and its
+    # default is "resume the previous session", so omitting the field is the
+    # opposite of a fresh start.
+    route = respx.post(f"{SB}/v1/sandboxes/sb1/tasks").mock(
+        return_value=httpx.Response(200, json={"id": "t3"}))
+    await make_client().submit_task("sb1", "review", timeout_s=60, continue_session=False)
+    assert json.loads(route.calls[0].request.content)["continue"] is False
+
+
+@respx.mock
+async def test_submit_task_without_continue_omits_the_field():
+    route = respx.post(f"{SB}/v1/sandboxes/sb1/tasks").mock(
+        return_value=httpx.Response(200, json={"id": "t4"}))
+    await make_client().submit_task("sb1", "do it", timeout_s=60)
+    assert "continue" not in json.loads(route.calls[0].request.content)
 
 
 @respx.mock
@@ -168,6 +234,19 @@ async def test_get_sandbox():
     c = make_client()
     info = await c.get_sandbox("sb1")
     assert info["preview"]["url"] == "https://s-sb1-3000.preview.x"
+    await c.aclose()
+
+
+@respx.mock
+async def test_exec_cmd_uses_the_unprefixed_route_and_returns_the_exit_code():
+    # The internal surface, like keepalive: /sandbox/{id}/exec, no /v1.
+    route = respx.post(f"{SB}/sandbox/sb1/exec").respond(
+        200, json={"stdout": "", "stderr": "", "exit_code": 1})
+    c = make_client()
+    res = await c.exec_cmd("sb1", ["python3", "-c", "pass"])
+    # A non-zero exit is an answer, not a failure — the caller decides.
+    assert res["exit_code"] == 1
+    assert json.loads(route.calls[0].request.content)["cmd"] == ["python3", "-c", "pass"]
     await c.aclose()
 
 

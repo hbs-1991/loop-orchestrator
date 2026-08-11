@@ -7,6 +7,7 @@ from loop_orchestrator import db as dbmod
 from loop_orchestrator import pipeline as pipeline_mod
 from loop_orchestrator.models import Run
 from loop_orchestrator.pipeline import ExecutionTimeout, Pipeline, RunFailure
+from loop_orchestrator.pipeline import clock as clock_mod
 
 from tests.conftest import FakeGitHub, FakeSandboxd, FakeSettings, FakeTG
 
@@ -23,7 +24,9 @@ class FakeClock:
 
 def patch_clock(monkeypatch) -> FakeClock:
     clock = FakeClock()
-    monkeypatch.setattr(pipeline_mod, "monotonic", clock)
+    # One patch point for every stage: the stage modules call
+    # `clock.monotonic()` through the module rather than binding the name.
+    monkeypatch.setattr(clock_mod, "monotonic", clock)
 
     async def fake_sleep(seconds):
         clock.now += seconds
@@ -54,6 +57,9 @@ async def test_execute_success(db):
     assert run.summary == "all done"
     assert run.task_id == "task-1"
     assert sb.tasks_submitted[0]["timeout_s"] == 90 * 60
+    # Explicitly fresh: sandboxd's `continue` default is "resume the previous
+    # session", so an omitted field is not a clean start.
+    assert sb.tasks_submitted[0]["continue"] is False
 
 
 async def test_execute_failure_raises(db):
@@ -133,10 +139,27 @@ async def test_run_sandbox_task_resumes_after_transient_api_error(db):
     ]
     run = await executing_run(db)
     task, _ = await make_pipe(db, sb)._run_sandbox_task(
-        run, "review please", 600, pipeline_mod.monotonic() + 600)
+        run, "review please", 600, clock_mod.monotonic() + 600)
     assert task["agent_message_final"] == "verdict"
     assert len(sb.tasks_submitted) == 2
     assert sb.tasks_submitted[1]["continue"] is True
+
+
+async def test_a_fresh_stage_still_forces_continue_on_recovery(db):
+    # Review/e2e now start clean, but a stream drop must resume THAT task's
+    # session: restarting it fresh would throw the stage's own work away.
+    sb = FakeSandboxd()
+    sb.task_results = [
+        {"status": "failed", "error_message":
+         "agent error: API Error: Response stalled mid-stream."},
+        {"status": "succeeded", "agent_message_final": "verdict"},
+    ]
+    run = await executing_run(db)
+    await make_pipe(db, sb)._run_sandbox_task(
+        run, "review please", 600, clock_mod.monotonic() + 600,
+        continue_session=False)
+    assert [t["continue"] for t in sb.tasks_submitted] == [False, True]
+    assert sb.tasks_submitted[1]["prompt"] == pipeline_mod.CONTINUE_PROMPT
 
 
 async def test_execute_times_out_on_working_time(db, monkeypatch):

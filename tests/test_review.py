@@ -1,11 +1,13 @@
 import pytest
 
 from loop_orchestrator.review import (
+    WORKING_EFFICIENTLY,
     Finding,
     Verdict,
     VerdictError,
     build_fix_prompt,
     build_review_prompt,
+    build_revise_prompt,
     format_review_comment,
     newly_fixed,
     parse_verdict,
@@ -67,6 +69,78 @@ def test_prompts_are_english_and_carry_context():
     assert "no timeout" in fp and "pytest -q" in fp and "Do not git push" in fp
     fp2 = build_fix_prompt(parse_verdict(FINDINGS), None)
     assert "pytest -q" not in fp2
+
+
+def test_review_prompt_is_self_contained_for_a_cold_session():
+    # The reviewer starts in a brand-new Claude session (sandboxd `continue: false`),
+    # so the prompt must carry the repo, the diff range and the documents itself.
+    rp = build_review_prompt("docs/s.md", "docs/p.md", "feat/x")
+    assert "fresh session" in rp and "no earlier conversation" in rp
+    assert "git diff origin/feat/x..HEAD" in rp
+    assert "git status --short" in rp
+    assert "docs/s.md" in rp and "docs/p.md" in rp
+    assert "do not quote the code back" in rp
+
+
+def test_fix_prompt_is_self_contained_for_a_cold_session():
+    fp = build_fix_prompt(parse_verdict(FINDINGS), None,
+                          "feat/x", "docs/s.md", "docs/p.md")
+    assert "fresh session" in fp and "no earlier conversation" in fp
+    assert "complete report" in fp
+    # The findings themselves are the whole input, and they carry their locations.
+    assert "app/api.py" in fp
+    # The reviewed diff and the documents a "deviates from the spec" finding
+    # refers to — neither is recallable from a session that does not exist.
+    assert "git diff origin/feat/x..HEAD" in fp
+    assert "docs/s.md" in fp and "docs/p.md" in fp
+
+
+def test_fix_prompt_degrades_without_the_optional_context():
+    fp = build_fix_prompt(parse_verdict(FINDINGS), None)
+    assert "git log --oneline -5" in fp
+    assert "Specification:" not in fp and "Plan:" not in fp
+    assert "fresh session" in fp
+
+
+def test_revise_prompt_is_self_contained_for_a_cold_session():
+    rp = build_revise_prompt("make the button blue", "pytest -q",
+                             "feat/x", "docs/s.md", "docs/p.md")
+    assert "fresh session" in rp and "no earlier conversation" in rp
+    assert "make the button blue" in rp
+    assert "git diff origin/feat/x..HEAD" in rp
+    assert "docs/s.md" in rp and "docs/p.md" in rp
+    assert "pytest -q" in rp and "Do not git push" in rp
+
+
+def test_revise_prompt_degrades_without_the_optional_context():
+    rp = build_revise_prompt("make the button blue", None)
+    assert "git log --oneline -5" in rp
+    assert "Specification:" not in rp and "pytest -q" not in rp
+
+
+def test_resumed_revise_prompt_does_not_restate_the_session():
+    # Continuing the executor's own session: it wrote the code and already
+    # carries the efficiency rules, so restating either would be paid-for noise.
+    rp = build_revise_prompt("make the button blue", "pytest -q", "feat/x",
+                             "docs/s.md", "docs/p.md", resumed=True)
+    assert "make the button blue" in rp and "pytest -q" in rp
+    assert "fresh session" not in rp
+    assert "git diff" not in rp and "docs/s.md" not in rp
+    assert WORKING_EFFICIENTLY not in rp
+    assert len(rp) < 600
+
+
+def test_review_prompts_carry_the_efficiency_block():
+    for p in (build_review_prompt("docs/s.md", "docs/p.md", "feat/x"),
+              build_fix_prompt(parse_verdict(FINDINGS), "pytest -q"),
+              build_revise_prompt("feedback", "pytest -q", "feat/x")):
+        assert WORKING_EFFICIENTLY in p
+
+
+def test_efficiency_block_states_the_two_rules_that_cost_money():
+    assert "prompt cache expires after five minutes" in WORKING_EFFICIENTLY
+    assert "never park in a single wait for" in WORKING_EFFICIENTLY
+    assert "Never re-read a file you have already read" in WORKING_EFFICIENTLY
 
 
 def test_format_review_comment():

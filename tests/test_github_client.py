@@ -100,6 +100,23 @@ async def test_required_checks_of_an_unreadable_branch_is_empty():
 
 
 @respx.mock
+async def test_behind_by_counts_what_the_base_has_and_the_head_lacks():
+    respx.get(f"{GH}/repos/o/r/compare/main...feat/x").mock(
+        return_value=httpx.Response(200, json={"status": "diverged",
+                                               "ahead_by": 3, "behind_by": 2}))
+    assert await GitHubClient("tok").behind_by("o/r", "main", "feat/x") == 2
+
+
+@respx.mock
+async def test_behind_by_is_zero_when_compare_cannot_be_read():
+    # Same stance as required_checks: a diagnostic that fails must not turn
+    # into a refusal to merge.
+    respx.get(f"{GH}/repos/o/r/compare/main...feat/x").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"}))
+    assert await GitHubClient("tok").behind_by("o/r", "main", "feat/x") == 0
+
+
+@respx.mock
 async def test_update_branch_422_raises():
     from loop_orchestrator.clients.github import GitHubError
     respx.put(f"{GH}/repos/o/r/pulls/5/update-branch").mock(
@@ -207,15 +224,66 @@ async def test_list_ready_issues_filters_prs():
 
 
 @respx.mock
-async def test_issue_blocked_by_open_only_and_absent_api():
+async def test_issue_dependencies_keep_repo_and_closed_entries():
     respx.get(f"{GH}/repos/o/r/issues/9/dependencies/blocked_by").mock(
         return_value=httpx.Response(200, json=[
-            {"number": 3, "state": "open"}, {"number": 4, "state": "closed"}]))
+            {"number": 3, "state": "open"},
+            {"number": 4, "state": "closed",
+             "repository": {"full_name": "o/backend"}}]))
     respx.get(f"{GH}/repos/o/r/issues/10/dependencies/blocked_by").mock(
         return_value=httpx.Response(404))
     gh = GitHubClient("t")
-    assert await gh.issue_blocked_by("o/r", 9) == [3]
-    assert await gh.issue_blocked_by("o/r", 10) == []
+    assert await gh.issue_dependencies("o/r", 9) == [
+        {"repo": "o/r", "number": 3, "state": "open"},
+        {"repo": "o/backend", "number": 4, "state": "closed"}]
+    assert await gh.issue_dependencies("o/r", 10) == []
+
+
+@respx.mock
+async def test_issue_blocked_by_is_open_numbers_only():
+    respx.get(f"{GH}/repos/o/r/issues/9/dependencies/blocked_by").mock(
+        return_value=httpx.Response(200, json=[
+            {"number": 3, "state": "open"}, {"number": 4, "state": "closed"}]))
+    assert await GitHubClient("t").issue_blocked_by("o/r", 9) == [3]
+
+
+@respx.mock
+async def test_issue_blocking_reverses_the_direction():
+    respx.get(f"{GH}/repos/o/r/issues/12/dependencies/blocking").mock(
+        return_value=httpx.Response(200, json=[
+            {"number": 13, "state": "open",
+             "repository": {"full_name": "o/frontend"}}]))
+    respx.get(f"{GH}/repos/o/r/issues/14/dependencies/blocking").mock(
+        return_value=httpx.Response(410))
+    gh = GitHubClient("t")
+    assert await gh.issue_blocking("o/r", 12) == [
+        {"repo": "o/frontend", "number": 13, "state": "open"}]
+    assert await gh.issue_blocking("o/r", 14) == []
+
+
+@respx.mock
+async def test_upsert_marked_comment_edits_the_existing_one():
+    respx.get(f"{GH}/repos/o/r/issues/12/comments").mock(
+        return_value=httpx.Response(200, json=[
+            {"id": 1, "body": "unrelated"},
+            {"id": 2, "body": "<!-- loop:api-contract -->old"}]))
+    patch = respx.patch(f"{GH}/repos/o/r/issues/comments/2").mock(
+        return_value=httpx.Response(200, json={}))
+    await GitHubClient("t").upsert_marked_comment(
+        "o/r", 12, "<!-- loop:api-contract -->", "new")
+    assert patch.called
+    assert json.loads(patch.calls[0].request.content) == {"body": "new"}
+
+
+@respx.mock
+async def test_upsert_marked_comment_creates_when_absent():
+    respx.get(f"{GH}/repos/o/r/issues/12/comments").mock(
+        return_value=httpx.Response(200, json=[{"id": 1, "body": "unrelated"}]))
+    post = respx.post(f"{GH}/repos/o/r/issues/12/comments").mock(
+        return_value=httpx.Response(201, json={}))
+    await GitHubClient("t").upsert_marked_comment(
+        "o/r", 12, "<!-- loop:api-contract -->", "new")
+    assert post.called
 
 
 @respx.mock

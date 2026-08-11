@@ -80,8 +80,13 @@ class SandboxdClient:
             app = await self._req("GET", f"/v1/apps/{app_id}")
             app.raise_for_status()
             existing = app.json().get("current_sandbox_id")
-            if existing:
+            if existing and (await self.get_sandbox(existing)).get("status") != "error":
                 return existing
+            # A creation that aborted mid-way leaves the sandbox row behind in
+            # `error`, and the retry of that 500 lands right here. Adopting it
+            # is worse than failing: it is 409 to every task from then on, so
+            # run #57 spent three hours submitting into a sandbox that could
+            # never run one (its image had been pruned off the host).
         r.raise_for_status()
         return r.json()["id"]
 
@@ -104,6 +109,43 @@ class SandboxdClient:
         except httpx.HTTPError:
             return False
 
+    async def stop_sandbox(self, sandbox_id: str) -> bool:
+        """Stop a sandbox without destroying it. True if it is now stopped.
+
+        The counterpart of `start_sandbox`, and the whole point of sleeping a
+        paused Run: the container releases its ~3.5 GB while the workspace `.img`
+        and the agent's session stay on disk. Idempotent — an already-stopped
+        sandbox answers 200.
+
+        sandboxd refuses with 409 `task_in_progress` while a task is running
+        (`v1StopSandbox` asks runtimed before stopping), which is exactly the
+        guard we want: a caller that mistimes this cannot kill a working agent.
+        Best-effort — a pause that fails to sleep is a pause that costs memory,
+        not a broken Run.
+        """
+        try:
+            r = await self._req("POST", f"/v1/sandboxes/{sandbox_id}/stop")
+            return r.status_code < 400
+        except httpx.HTTPError:
+            return False
+
+    async def validate_manifest(self, raw: str) -> list[str]:
+        """Errors sandboxd finds in a `sandbox.yaml`, empty when it accepts it.
+
+        The control plane owns the schema (`internal/manifest`), so asking it
+        beats re-implementing the rules here — v1 is a closed key set, and a
+        manifest it rejects means no web process and therefore no preview at
+        all. A validator that is unreachable returns no errors: it is a
+        pre-flight check, not a gate.
+        """
+        try:
+            r = await self._req("POST", "/v1/runtime/manifest/validate",
+                                json={"manifest": raw})
+            r.raise_for_status()
+            return [str(e) for e in (r.json().get("errors") or [])]
+        except httpx.HTTPError:
+            return []
+
     async def keepalive(self, sandbox_id: str, minutes: int) -> None:
         """Hold off sandboxd's idle reaper for the next `minutes`.
 
@@ -123,11 +165,51 @@ class SandboxdClient:
         except httpx.HTTPError:
             pass
 
+    async def exec_cmd(self, sandbox_id: str, cmd: list[str],
+                       timeout_s: float = 60.0) -> dict:
+        """Run a command in the sandbox without spawning the agent.
+
+        For anything mechanical — start a server, probe a port, read a log —
+        this is what `submit_task` should not be used for: an agent task costs a
+        model call and the better part of a minute, this costs a round trip.
+
+        Two things sandboxd does NOT do for us (`internal/docker/docker.go`,
+        `Client.Exec`): it passes neither `-u` nor `-w`, so the command runs as
+        the image's user in the image's WORKDIR — `cd` into the app directory
+        yourself. Like keepalive, the route lives on the internal surface with
+        no `/v1` prefix; unlike keepalive it also bumps `last_active_at`, so a
+        polling loop built on it needs no keepalive of its own.
+
+        Returns sandboxd's `{"stdout", "stderr", "exit_code"}`. A non-zero exit
+        code is a normal answer, not an error — only transport and HTTP failures
+        raise.
+        """
+        r = await self._req("POST", f"/sandbox/{sandbox_id}/exec",
+                            json={"cmd": cmd}, timeout=timeout_s)
+        r.raise_for_status()
+        return r.json()
+
     async def submit_task(self, sandbox_id: str, prompt: str, timeout_s: int,
-                          continue_session: bool = False, model: str | None = None) -> str:
+                          continue_session: bool | None = None,
+                          model: str | None = None) -> str:
+        """Submit an agent task. `continue_session` mirrors sandboxd's tri-state
+        `continue` field (control-plane `v1_sandbox_tasks.go`):
+
+        - `None` — the field is omitted and the platform decides. Its default is
+          **continue whenever the sandbox already has a session**, so an omitted
+          field is not "fresh"; every stage after the first inherits the previous
+          stage's whole context.
+        - `True` — force `claude --continue` (resume an interrupted stage).
+        - `False` — force a brand-new session.
+
+        Passing it explicitly is a cost decision, not cosmetics: an inherited
+        context is re-sent on every call of the new stage, and a stage that also
+        switches model (executor → reviewer) invalidates the prompt cache, so the
+        entire inherited context is re-billed at write price on the first call.
+        """
         body: dict = {"prompt": prompt, "agent": "claude-code", "timeout_s": timeout_s}
-        if continue_session:
-            body["continue"] = True
+        if continue_session is not None:
+            body["continue"] = continue_session
         if model:
             body["model"] = model
         r = await self._req("POST", f"/v1/sandboxes/{sandbox_id}/tasks", json=body)

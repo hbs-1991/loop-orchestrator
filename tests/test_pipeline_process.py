@@ -315,7 +315,6 @@ async def test_process_pauses_for_approval(db, tmp_path):
         {"status": "succeeded", "agent_message": "did the work"},   # execute
         {"status": "succeeded",
          "agent_message_final": '{"verdict": "clean", "summary": "ok", "findings": []}'},
-        {"status": "succeeded", "agent_message": "server is up"},   # preview task
     ]
     sb.push_resp = {"pushed": True, "branch": branch, "commits": 2}
     await make_pipe(db, tmp_path, gh, sb, tg).process(run)
@@ -327,12 +326,41 @@ async def test_process_pauses_for_approval(db, tmp_path):
     assert f"awaiting:{run.id}" in tg.sent
     assert STAGING in tg.card_states
     assert gh.ff_calls == []                  # PR branch untouched before approve
-    assert sb.apps_deleted == []              # sandbox stays alive for the preview
-    # Nothing polls during the pause, so the idle reaper would stop the sandbox
-    # and kill the preview link well before our own TTL runs out.
+    assert sb.apps_deleted == []              # the app survives; only the container sleeps
+    # The pause sleeps instead of being held awake: the manifest lets the wake
+    # path bring the same server back, so 3.5 GB is not parked for two hours.
+    assert sb.stopped == [run.sandbox_id]
+    assert sb.keepalives == [] or (run.sandbox_id, 120) not in sb.keepalives
+    assert any(path == "sandbox.yaml" for _, path, _ in sb.files_written)
+    # The preview costs no model call: the server is started through exec, and
+    # the URL is only recorded once the port answers.
+    assert not any("npm run dev" in t["prompt"] for t in sb.tasks_submitted)
+    script = sb.execs[0]["cmd"]
+    assert script[:2] == ["sh", "-c"]
+    assert "nohup npm run dev -- --port 3000 > .loop/preview.log" in script[2]
+    assert any(e["cmd"][0] == "python3" for e in sb.execs[1:])   # port probe
+
+
+async def test_pause_stays_awake_when_the_preview_cannot_survive_a_sleep(db, tmp_path):
+    """No manifest, no sleep. If the platform cannot bring the preview server
+    back on its own, stopping the sandbox would turn the link into a permanent
+    502 — so the old behaviour (held awake for the whole TTL) has to remain."""
+    gh, sb, tg = FakeGitHub(), FakeSandboxd(), FakeTG()
+    seed_approval(gh, tmp_path)
+    run = await dbmod.create_run(db, "o/myrepo", 5, "feat/x")
+    branch = f"loop/run-{run.id}"
+    sb.task_results = [
+        {"status": "succeeded", "agent_message": "did the work"},
+        {"status": "succeeded",
+         "agent_message_final": '{"verdict": "clean", "summary": "ok", "findings": []}'},
+    ]
+    sb.push_resp = {"pushed": True, "branch": branch, "commits": 2}
+    sb.manifest_errors = ["unknown top-level key \"web_process\""]
+    await make_pipe(db, tmp_path, gh, sb, tg).process(run)
+    assert run.state == AWAITING_APPROVAL
+    assert run.preview_url == "https://s-x-3000.preview.test"   # link still published
+    assert sb.stopped == []                                     # but never slept
     assert (run.sandbox_id, 120) in sb.keepalives
-    # the preview task was submitted with the run command
-    assert any("npm run dev" in t["prompt"] for t in sb.tasks_submitted)
 
 
 async def test_process_resumes_from_publishing_after_approve(db, tmp_path):
@@ -440,6 +468,26 @@ async def test_run_sandbox_task_waits_out_not_ready_sandbox(db):
     task, _ = await pipe._run_sandbox_task(run, "review it", 60, monotonic() + 60)
     assert task["agent_message_final"] == "verdict"
     assert len(sb.tasks_submitted) == 1
+
+
+async def test_run_sandbox_task_fails_fast_on_a_sandbox_in_error(db):
+    """Run #57: the workspace seed failed at creation (the sandbox image had
+    been pruned off the host overnight), so the sandbox answered 409 to every
+    submit and never would answer anything else. Waiting it out spent three
+    silent hours of the run's budget — a sandbox sandboxd reports as `error`
+    must fail the stage immediately instead."""
+    import pytest
+    from time import monotonic
+
+    from loop_orchestrator.pipeline import RunFailure
+    pipe, gh, sb, tg = make_pipeline(db)
+    run = await make_run_in(db, EXECUTING)
+    sb.submit_conflicts = 99                   # never becomes ready
+    sb.tasks_listed = []
+    sb.sandbox_info = {"status": "error"}
+    with pytest.raises(RunFailure, match="'error'"):
+        await pipe._run_sandbox_task(run, "review it", 600, monotonic() + 600)
+    assert sb.tasks_submitted == []            # nothing ever ran
 
 
 async def test_run_sandbox_task_conflict_past_deadline_reraises(db):

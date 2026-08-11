@@ -20,9 +20,9 @@ def _ok(msg):
     return {"status": "succeeded", "agent_message_final": msg}
 
 
-async def _make(db, tmp_path, task_results):
+async def _make(db, tmp_path, task_results, loop_yml=None):
     gh = FakeGitHub()
-    gh.files[".loop.yml"] = LOOP_YML
+    gh.files[".loop.yml"] = loop_yml or LOOP_YML
     sb = FakeSandboxd()
     sb.task_results = list(task_results)
     tg = FakeTG()
@@ -68,7 +68,65 @@ async def test_advisor_model_and_revise_cycle(db, tmp_path):
     prompts = [t["prompt"] for t in sb.tasks_submitted]
     assert "Add a rollback step" in prompts[2]          # revise prompt to planner
     assert sb.tasks_submitted[1]["model"] == "claude-fable-5"  # advisor model
-    assert sb.tasks_submitted[2]["continue"] is True    # planner keeps its session
+    assert sb.tasks_submitted[1]["continue"] is False   # advisor judges the documents
+    # Every round is fresh: `continue` would resume the most recent session,
+    # which after the advisor round is the advisor's, not the planner's.
+    assert [t["continue"] for t in sb.tasks_submitted] == [False] * 4
+    # So the revise prompt has to carry what the session used to.
+    assert "docs/specs/issue-7-design.md" in prompts[2]
+    assert ".loop/task.md" in prompts[2]
+
+
+PLANNING_YML = """specs_dir: docs/specs
+planning:
+  model: claude-opus-5
+  advisor:
+    model: claude-sonnet-5
+    max_iterations: 0
+"""
+
+
+async def test_repo_config_picks_the_planner_and_advisor_models(db, tmp_path):
+    pipeline, run, gh, sb, tg = await _make(
+        db, tmp_path, [_ok(PLAN_JSON), _ok(APPROVED_JSON)], loop_yml=PLANNING_YML)
+    gh.branch_shas[f"loop/run-{run.id}"] = "plansha"
+    await pipeline.process(run)
+    assert run.state == "done"
+    assert sb.tasks_submitted[0]["model"] == "claude-opus-5"    # planner
+    assert sb.tasks_submitted[1]["model"] == "claude-sonnet-5"  # advisor
+    # Snapshotted onto the Run, so a .loop.yml edited mid-Run cannot change the
+    # rules this Run started under.
+    fresh = await dbmod.get_run(db, run.id)
+    assert (fresh.planner_model, fresh.advisor_model) == ("claude-opus-5",
+                                                          "claude-sonnet-5")
+    assert fresh.plan_max_iterations == 0
+
+
+async def test_repo_config_caps_the_revise_rounds(db, tmp_path):
+    # max_iterations: 0 — one advisor round, no rewrite, then escalation.
+    pipeline, run, gh, sb, tg = await _make(
+        db, tmp_path, [_ok(PLAN_JSON), _ok(REVISE_JSON), _ok(PLAN_JSON)],
+        loop_yml=PLANNING_YML)
+    await pipeline.process(run)
+    assert run.state == "failed"
+    assert len(sb.tasks_submitted) == 2          # planner + advisor, no revise
+    assert "did not approve the plan after 1 iteration" in (run.error or "")
+
+
+ADVISOR_OFF_YML = "specs_dir: docs/specs\nplanning:\n  advisor:\n    enabled: false\n"
+
+
+async def test_advisor_can_be_switched_off_per_repo(db, tmp_path):
+    pipeline, run, gh, sb, tg = await _make(db, tmp_path, [_ok(PLAN_JSON)],
+                                            loop_yml=ADVISOR_OFF_YML)
+    gh.branch_shas[f"loop/run-{run.id}"] = "plansha"
+    await pipeline.process(run)
+    assert run.state == "done"
+    assert len(sb.tasks_submitted) == 1          # the planner, and nobody else
+    assert gh.prs_created, "the plan must still reach a PR"
+    details = [row[0] for row in await db.execute_fetchall(
+        "SELECT detail FROM run_events WHERE run_id = ?", (run.id,))]
+    assert any("advisor disabled" in d for d in details)
 
 
 async def test_full_planning_run_publishes_pr_with_loop_run_label(db, tmp_path):

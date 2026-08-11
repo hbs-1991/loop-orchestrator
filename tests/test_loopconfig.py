@@ -2,7 +2,7 @@ import pytest
 
 from loop_orchestrator.loopconfig import (
     LoopConfigError, find_spec_plan_pair, parse_loop_config, plans_dir,
-    resolve_base_branch,
+    planning_enabled, resolve_base_branch,
 )
 
 FULL = """
@@ -169,6 +169,54 @@ def test_base_branch_rejects_blank():
         parse_loop_config("specs_dir: docs/specs\nbase_branch: '   '")
 
 
+def test_planning_defaults_to_on_with_platform_models():
+    # A repo that says nothing about planning is planned exactly as before, and
+    # every model stays with its LOOP_* setting.
+    cfg = parse_loop_config("specs_dir: docs/specs")
+    assert cfg.planning_enabled is True and cfg.advisor_enabled is True
+    assert cfg.planner_model is None and cfg.advisor_model is None
+    assert cfg.plan_max_iterations is None
+
+
+def test_planning_section_is_parsed():
+    cfg = parse_loop_config("""
+specs_dir: docs/specs
+planning:
+  enabled: true
+  model: claude-opus-5
+  advisor:
+    enabled: false
+    model: claude-fable-5
+    max_iterations: 1
+""")
+    assert cfg.planning_enabled is True
+    assert cfg.planner_model == "claude-opus-5"
+    assert cfg.advisor_enabled is False
+    assert cfg.advisor_model == "claude-fable-5"
+    assert cfg.plan_max_iterations == 1
+
+
+def test_planning_can_be_switched_off_wholesale():
+    cfg = parse_loop_config("specs_dir: docs/specs\nplanning:\n  enabled: false")
+    assert cfg.planning_enabled is False
+    # The advisor keeps its own default — the two switches are independent.
+    assert cfg.advisor_enabled is True
+
+
+@pytest.mark.parametrize("bad", [
+    "specs_dir: d\nplanning: nope",
+    "specs_dir: d\nplanning:\n  enabled: yes please",
+    "specs_dir: d\nplanning:\n  model: ''",
+    "specs_dir: d\nplanning:\n  advisor: 3",
+    "specs_dir: d\nplanning:\n  advisor:\n    enabled: 1",
+    "specs_dir: d\nplanning:\n  advisor:\n    max_iterations: -1",
+    "specs_dir: d\nplanning:\n  advisor:\n    max_iterations: true",
+])
+def test_planning_section_rejects_nonsense(bad):
+    with pytest.raises(LoopConfigError):
+        parse_loop_config(bad)
+
+
 class _GH:
     def __init__(self, default="main", file=None):
         self.default, self.file = default, file
@@ -197,3 +245,26 @@ async def test_resolve_base_branch_survives_a_broken_config():
     # better than an obscure failure while creating the issue branch.
     gh = _GH(file="specs_dir:\n  - not a string")
     assert await resolve_base_branch(gh, "o/r") == "main"
+
+
+async def test_planning_enabled_reads_the_default_branch():
+    gh = _GH(file="specs_dir: docs/specs\nplanning:\n  enabled: false")
+    assert await planning_enabled(gh, "o/r") is False
+    # Same reason as base_branch: the issue branch does not exist yet.
+    assert gh.read_from == "main"
+
+
+@pytest.mark.parametrize("file", [None, "specs_dir:\n  - not a string"])
+async def test_planning_enabled_is_fail_safe_on(file):
+    # Switching planning off is a statement a repo makes in a config that
+    # parses; a missing or broken file is not that statement.
+    assert await planning_enabled(_GH(file=file), "o/r") is True
+
+
+async def test_planning_enabled_survives_an_unreachable_github():
+    class Dead:
+        async def get_repo_default_branch(self, repo):
+            raise RuntimeError("502 from GitHub")
+
+    # A fetch that failed must not silently stop a backlog.
+    assert await planning_enabled(Dead(), "o/r") is True

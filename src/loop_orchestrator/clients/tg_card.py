@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from ..models import (
     AWAITING_APPROVAL,
     CANCELLED,
+    CONTRACTING,
     DONE,
     E2E_TESTING,
     EXECUTING,
@@ -23,11 +24,12 @@ from ..models import (
     Run,
 )
 
-STAGES = (QUEUED, PREPARING, EXECUTING, REVIEWING, E2E_TESTING,
+STAGES = (QUEUED, PREPARING, EXECUTING, REVIEWING, E2E_TESTING, CONTRACTING,
           STAGING, AWAITING_APPROVAL, PUBLISHING, REPORTING)
 PLANNING_STAGES = (QUEUED, PREPARING, PLANNING, PUBLISHING, REPORTING)
 _LABELS = {QUEUED: "queued", PREPARING: "preparing", EXECUTING: "executing",
            REVIEWING: "reviewing", E2E_TESTING: "e2e testing",
+           CONTRACTING: "contracting",
            STAGING: "staging", AWAITING_APPROVAL: "awaiting approval",
            PUBLISHING: "publishing", REPORTING: "reporting",
            PLANNING: "planning"}
@@ -119,6 +121,9 @@ def render_card(run: Run, events: list[tuple[str, str]], tz: str) -> str:
         elif prepared and stage == REVIEWING and not run.review_enabled:
             icon = "➖"
         elif prepared and stage == E2E_TESTING and not run.e2e_enabled:
+            icon = "➖"
+        elif prepared and stage == CONTRACTING and (
+                not run.contract_enabled or run.contract_status == "skipped"):
             icon = "➖"
         elif prepared and stage == AWAITING_APPROVAL and run.approval_mode == "never":
             icon = "➖"

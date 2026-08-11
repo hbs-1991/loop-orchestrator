@@ -4,7 +4,7 @@ GitHub is the source of truth; the scheduler rebuilds these rows on every
 tick, so any conflict resolves in GitHub's favour by construction.
 """
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import aiosqlite
 
@@ -28,13 +28,17 @@ class IssueTask:
     run_id: int | None
     topic_id: int | None
     updated_at: str
+    # Every dependency ever seen, open or closed — see set_depends_on. Last and
+    # defaulted so callers that predate the handoff keep constructing the task.
+    depends_on: list[dict] = field(default_factory=list)
 
 
 def _to_task(row: aiosqlite.Row) -> IssueTask:
     return IssueTask(
         id=row["id"], repo=row["repo"], issue_number=row["issue_number"],
         title=row["title"], lane=row["lane"], state=row["state"],
-        blocked_by=json.loads(row["blocked_by"]), run_id=row["run_id"],
+        blocked_by=json.loads(row["blocked_by"]),
+        depends_on=json.loads(row["depends_on"]), run_id=row["run_id"],
         topic_id=row["topic_id"], updated_at=row["updated_at"])
 
 
@@ -85,6 +89,12 @@ async def set_state(db, repo, issue_number, state: str) -> None:
 
 async def set_blocked_by(db, repo, issue_number, blockers: list[int]) -> None:
     await _set(db, repo, issue_number, "blocked_by", json.dumps(sorted(blockers)))
+
+
+async def set_depends_on(db, repo, issue_number, deps: list[dict]) -> None:
+    """Every dependency, open or closed — `blocked_by` forgets them on closing,
+    and closing is exactly when the handoff needs them."""
+    await _set(db, repo, issue_number, "depends_on", json.dumps(deps))
 
 
 async def set_run(db, repo, issue_number, run_id: int) -> None:

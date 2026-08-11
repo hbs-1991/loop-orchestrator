@@ -9,7 +9,16 @@ from loop_orchestrator.clients.tg_card import (
     topic_final_name,
     topic_name,
 )
-from loop_orchestrator.models import AWAITING_APPROVAL, CANCELLED, Run
+from loop_orchestrator.models import (
+    AWAITING_APPROVAL,
+    CANCELLED,
+    CONTRACTING,
+    EXECUTING,
+    PREPARING,
+    QUEUED,
+    STAGING,
+    Run,
+)
 
 
 def make_run(**kw) -> Run:
@@ -198,3 +207,19 @@ def test_planning_topic_name_uses_issue_number():
     run = Run(id=1, repo="o/r", pr_number=0, head_branch="loop/issue-7",
               state="queued", kind="planning", issue_number=7, pr_title="T")
     assert topic_name(run) == "⏳ T · #7"
+
+
+def test_card_shows_contracting_and_skips_it_when_disabled():
+    run = Run(id=1, repo="o/r", pr_number=5, head_branch="b", state=STAGING)
+    events = [(QUEUED, "2026-08-08 10:00:00"), (PREPARING, "2026-08-08 10:01:00"),
+              (EXECUTING, "2026-08-08 10:02:00"), (STAGING, "2026-08-08 10:30:00")]
+    text = render_card(run, events, "UTC")
+    assert "➖ contracting" in text          # run not tied to an issue
+
+    run.contract_enabled = True
+    run.contract_status = "skipped"          # the issue blocks nobody
+    assert "➖ contracting" in render_card(run, events, "UTC")
+
+    run.contract_status = "produced"
+    run.state = CONTRACTING
+    assert "⏳ contracting" in render_card(run, events, "UTC")

@@ -46,3 +46,20 @@ async def test_run_topic_and_repos(db):
     task = await it.get_task(db, "o/r", 7)
     assert (task.run_id, task.topic_id) == (42, 777)
     assert await it.repos_with_tasks(db) == ["o/r"]
+
+
+async def test_depends_on_survives_the_blocker_closing(db):
+    await it.upsert_task(db, "o/frontend", 13, "T", None)
+    await it.set_blocked_by(db, "o/frontend", 13, [12])
+    await it.set_depends_on(db, "o/frontend", 13,
+                            [{"repo": "o/backend", "number": 12}])
+    # The blocker closes: the gate clears, the link does not.
+    await it.set_blocked_by(db, "o/frontend", 13, [])
+    task = await it.get_task(db, "o/frontend", 13)
+    assert task.blocked_by == []
+    assert task.depends_on == [{"repo": "o/backend", "number": 12}]
+
+
+async def test_depends_on_defaults_to_empty(db):
+    await it.upsert_task(db, "o/frontend", 14, "T", None)
+    assert (await it.get_task(db, "o/frontend", 14)).depends_on == []

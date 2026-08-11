@@ -1,5 +1,6 @@
 import pytest
 
+from loop_orchestrator.contracts import Upstream
 from loop_orchestrator.planning import (
     PlanningError,
     build_advisor_prompt,
@@ -64,9 +65,26 @@ def test_prompts_mention_paths_and_schema():
     assert ".loop/task.md" in p and "s/issue-7-design.md" in p and "make setup" in p
     a = build_advisor_prompt("s/issue-7-design.md", "p/issue-7.md")
     assert "approved | revise" in a
-    r = build_planner_revise_prompt(parse_advisor_verdict(
-        '{"verdict": "revise", "summary": "s", "issues": ["fix X"]}'))
+    r = build_planner_revise_prompt(
+        parse_advisor_verdict(
+            '{"verdict": "revise", "summary": "s", "issues": ["fix X"]}'),
+        7, "s/issue-7-design.md", "p/issue-7.md")
     assert "fix X" in r
+
+
+def test_revise_prompt_is_self_contained():
+    # It runs in a fresh session (sandboxd would otherwise resume the advisor's,
+    # not the planner's), so everything the session used to carry is in the text.
+    r = build_planner_revise_prompt(
+        parse_advisor_verdict(
+            '{"verdict": "revise", "summary": "thin", "issues": ["fix X"]}'),
+        7, "s/issue-7-design.md", "p/issue-7.md")
+    assert ".loop/task.md" in r
+    assert "s/issue-7-design.md" in r and "p/issue-7.md" in r
+    assert "#7" in r
+    assert "uv.lock" in r and "git checkout --" in r
+    assert "Do not git push" in r
+    assert "outcome" in r  # the JSON schema survives the rewrite
 
 
 def test_planner_prompt_forbids_lockfiles():
@@ -97,6 +115,34 @@ def test_advisor_prompt_checks_spec_and_plan_quality():
     # Calibration: the Advisor must not bounce a usable plan over style.
     assert "Wording preferences" in a
     assert "Do NOT modify, commit or push anything" in a
+
+
+def test_planner_prompt_forbids_inventing_an_interface():
+    p = build_planner_prompt(7, "s.md", "p.md")
+    assert ".loop/context/" in p
+    assert "Upstream dependencies" in p
+    assert "do not invent" in p.lower()
+    assert '"questions"' in p
+
+
+def test_advisor_prompt_demands_traceable_endpoints():
+    a = build_advisor_prompt("s.md", "p.md")
+    assert ".loop/context/" in a
+    assert "traceable" in a.lower()
+
+
+def test_task_file_carries_the_upstream_section():
+    text = build_task_file(
+        {"number": 13, "title": "F", "body": "B", "labels": []}, [],
+        [Upstream(repo="o/backend", number=12, contract_md="### POST /v1/x")])
+    assert "# Issue #13" in text
+    assert "## Upstream dependencies" in text
+    assert "### POST /v1/x" in text
+
+
+def test_task_file_without_upstreams_is_unchanged():
+    text = build_task_file({"number": 13, "title": "F", "body": "B", "labels": []}, [])
+    assert "Upstream dependencies" not in text
 
 
 def test_build_task_file_snapshot():

@@ -17,14 +17,17 @@ SET list: without it, a restart between `publishing` and `reporting` sent a plan
 
 ## States
 
-`queued → preparing → executing → reviewing → e2e_testing → staging → awaiting_approval →
-publishing → reporting → done|failed|cancelled`, plus `planning` instead of `executing…staging` for a
-planning Run. Transitions are validated by `state_machine.TRANSITIONS` and written to `run_events` —
-which is also what the progress card is drawn from.
+`queued → preparing → executing → reviewing → e2e_testing → contracting → staging →
+awaiting_approval → publishing → reporting → done|failed|cancelled`, plus `planning` instead of
+`executing…staging` for a planning Run. Transitions are validated by `state_machine.TRANSITIONS` and
+written to `run_events` — which is also what the progress card is drawn from.
 
 Config-driven skips: `reviewing` and `e2e_testing` per `.loop.yml`; `awaiting_approval` when
-`approval: never`. Going back `awaiting_approval → executing` is the revise loop (a fix requested by
-replying in Telegram).
+`approval: never`. `contracting` is skipped when the Run has no issue or its issue blocks nobody —
+the decision is made inside the stage, so `staging` stays a legal target of all three verification
+states ([[concepts/contract-handoff]]). Going back `awaiting_approval → executing` is the revise loop
+(a fix requested by replying in Telegram) — and it replays `contracting`, which is exactly why that
+stage stands before the pause rather than after publication.
 
 ## Invariants
 
@@ -34,9 +37,11 @@ replying in Telegram).
 - **An agent crash on execute is not lost work:** `_publish_partial` best-effort publishes the commits
   already made.
 - **A sandbox lives exactly as long as it is needed.** It is deleted together with the app at the end of
-  the Run; during the `awaiting_approval` pause it lives for `LOOP_PREVIEW_TTL_MINUTES` and is then
-  finished off by the reaper in `worker`. Its death does **not** block approve/merge — the code is
-  already in the temporary branch ([[concepts/publication]]).
+  the Run; during the `awaiting_approval` pause it is **stopped**, not held awake, and the app is
+  finished off after `LOOP_PREVIEW_TTL_MINUTES` by the reaper in `worker`. Opening the preview link
+  starts the container again (traefik's wake catch-all), `revise` wakes it explicitly, and its death
+  does **not** block approve/merge — the code is already in the temporary branch
+  ([[concepts/publication]], [[decisions/0015-sleep-the-paused-sandbox]]).
 - **The stage deadline is the only boundary.** It is monotonic: rate-limit pauses do not eat into it
   (`ExecutionTimeout`), and transient polling errors simply wait for the next tick
   ([[concepts/resilience]]).
@@ -64,6 +69,7 @@ it to `withdrawn`) and put it back. There is no direct path from `failed` into t
 ## Links
 
 - [[components/pipeline]] — the stage code · [[components/worker-and-scheduler]] — queue and recovery
-- [[concepts/publication]] · [[concepts/resilience]] · [[components/storage-and-config]]
+- [[concepts/publication]] · [[concepts/resilience]] · [[components/storage-and-config]] ·
+  [[concepts/contract-handoff]]
 - MVP spec (states are a Locked Decision):
   [`docs/superpowers/specs/2026-07-31-loop-engineering-mvp-design.md`](../../superpowers/specs/2026-07-31-loop-engineering-mvp-design.md)

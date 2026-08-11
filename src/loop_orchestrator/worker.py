@@ -1,9 +1,13 @@
 import asyncio
+import logging
 
 from . import db as dbmod
+from .clients.telegram import gate_kb
 from .models import (
     ACTIVE_STATES,
     AWAITING_APPROVAL,
+    CONTRACTING,
+    DONE,
     E2E_TESTING,
     EXECUTING,
     PLANNING,
@@ -15,6 +19,8 @@ from .models import (
     STAGING,
 )
 
+log = logging.getLogger(__name__)
+
 
 class Worker:
     def __init__(self, db, settings, pipeline):
@@ -22,6 +28,7 @@ class Worker:
         self.settings = settings
         self.pipeline = pipeline
         self.scheduler = None  # set by the app lifespan; ticked after every run
+        self.actions = None    # set by the app lifespan; reads the merge gate
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._consumers: list[asyncio.Task] = []
         self._reaper: asyncio.Task | None = None
@@ -69,21 +76,59 @@ class Worker:
             if run.app_id and run.sandbox_expires_at and run.sandbox_expires_at <= now:
                 await self.pipeline.expire_preview(run)
 
+    async def repaint_merge_buttons(self, run) -> None:
+        """Redraw one run's merge keyboard from the live gate.
+
+        Painted unconditionally rather than diffed against a local memo:
+        `_run_action` clears this keyboard after every press, so a memo would
+        decide "unchanged" and leave the message with no buttons at all.
+        Telegram answers "not modified" for a repaint that changes nothing,
+        which `set_buttons` treats as success.
+        """
+        if (self.actions is None or run.merged_at or not run.pr_number
+                or not run.tg_merge_message_id):
+            return
+        try:
+            g = await self.actions.gate(run)
+            await self.pipeline.tg.set_buttons(
+                run.tg_merge_message_id,
+                gate_kb(run.id, g.state, list(g.red), g.done, g.total))
+        except Exception:  # noqa: BLE001 — a button is never worth a crash
+            log.warning("merge button repaint failed for run=%s", run.id,
+                        exc_info=True)
+
+    async def refresh_merge_buttons_once(self) -> None:
+        """Sweep every finished run's keyboard.
+
+        The `check_run` webhook is what makes the buttons follow CI promptly;
+        this sweep is the safety net behind it — a delivery GitHub dropped, or
+        one that arrived while the orchestrator was restarting, would otherwise
+        leave a keyboard frozen until someone pressed the indicator.
+        """
+        for run in await dbmod.runs_in_states(self.db, {DONE}):
+            await self.repaint_merge_buttons(run)
+
     async def _reap_loop(self) -> None:
         while True:
             try:
                 await self.reap_expired_once()
             except Exception:  # noqa: BLE001 — the reaper must survive anything
                 pass
+            try:
+                await self.refresh_merge_buttons_once()
+            except Exception:  # noqa: BLE001
+                pass
             await asyncio.sleep(60)
 
     async def recover(self) -> None:
-        # queued: not started yet; planning/executing/reviewing/e2e_testing:
-        # restartable — _planning starts a fresh planner iteration, _execute
-        # re-polls its task, _review starts a fresh review iteration,
-        # _e2e starts a fresh e2e iteration.
+        # queued: not started yet; planning/executing/reviewing/e2e_testing/
+        # contracting: restartable — _planning starts a fresh planner iteration,
+        # _execute re-polls its task, _review starts a fresh review iteration,
+        # _e2e starts a fresh e2e iteration, _contracting re-captures the
+        # contract and overwrites the row it keys.
         for run in await dbmod.runs_in_states(
-                self.db, {QUEUED, PLANNING, EXECUTING, REVIEWING, E2E_TESTING}):
+                self.db, {QUEUED, PLANNING, EXECUTING, REVIEWING, E2E_TESTING,
+                          CONTRACTING}):
             self.enqueue(run.id)
         # Other active steps are not idempotent — fail honestly with a hint.
         # awaiting_approval is deliberately in neither set: it is persistent.

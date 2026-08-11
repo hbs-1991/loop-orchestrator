@@ -4,6 +4,7 @@ from loop_orchestrator import db as dbmod
 from loop_orchestrator.models import (
     AWAITING_APPROVAL,
     CANCELLED,
+    CONTRACTING,
     DONE,
     E2E_TESTING,
     EXECUTING,
@@ -136,3 +137,17 @@ def test_phase4a_transitions_present():
         assert CANCELLED in TRANSITIONS[state]
     # publishing/reporting still cannot be cancelled
     assert CANCELLED not in TRANSITIONS[PUBLISHING]
+
+
+async def test_contracting_sits_between_verification_and_staging(db):
+    run = await dbmod.create_run(db, "o/r", 5, "b")
+    for state in (PREPARING, EXECUTING, CONTRACTING, STAGING):
+        await transition(db, run, state)
+    assert run.state == STAGING
+
+
+async def test_every_verification_stage_can_reach_contracting(db):
+    assert CONTRACTING in TRANSITIONS[EXECUTING]
+    assert CONTRACTING in TRANSITIONS[REVIEWING]
+    assert CONTRACTING in TRANSITIONS[E2E_TESTING]
+    assert TRANSITIONS[CONTRACTING] == {STAGING, FAILED, CANCELLED}

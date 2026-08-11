@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +67,52 @@ CREATE TABLE IF NOT EXISTS issue_tasks (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(repo, issue_number)
 );
+-- What a Run built, for the tasks its issue blocks. Keyed by the producing
+-- issue: a consumer resolves it through issue_tasks.depends_on. A revise
+-- re-runs the stage, so the row is replaced rather than appended to.
+CREATE TABLE IF NOT EXISTS upstream_contracts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo TEXT NOT NULL,
+  issue_number INTEGER NOT NULL,
+  run_id INTEGER,
+  pr_number INTEGER,
+  head_sha TEXT NOT NULL DEFAULT '',
+  contract_md TEXT NOT NULL DEFAULT '',
+  sources_json TEXT NOT NULL DEFAULT '[]',
+  breaking_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(repo, issue_number)
+);
+-- Per-Run cost rollup. Jaeger holds the detail for LOOP_TRACE_RETENTION_DAYS;
+-- these two tables outlive it and answer "what did we spend" without a query
+-- language. A revise re-runs every stage, so both are keyed for replacement.
+CREATE TABLE IF NOT EXISTS run_traces (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(id),
+  trace_id TEXT NOT NULL,
+  api_calls INTEGER NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0,
+  tokens_input INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+  tokens_output INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS run_stage_costs (
+  run_id INTEGER NOT NULL REFERENCES runs(id),
+  stage TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  fresh INTEGER,
+  api_calls INTEGER NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0,
+  tokens_input INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+  tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+  tokens_output INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (run_id, stage)
+);
 """
 
 _RUN_FIELDS = (
@@ -78,7 +125,9 @@ _RUN_FIELDS = (
     "pr_title", "tg_thread_id", "tg_card_message_id",
     "approval_mode", "staging_branch", "preview_url", "sandbox_expires_at",
     "merged_at", "tg_approval_message_id",
-    "kind", "issue_number", "lane",
+    "kind", "issue_number", "lane", "tg_merge_message_id",
+    "contract_enabled", "contract_status", "contract_json",
+    "planner_model", "advisor_enabled", "advisor_model", "plan_max_iterations",
 )
 
 # Columns added after phase 1; applied to live databases via ALTER TABLE.
@@ -108,7 +157,29 @@ _MIGRATIONS = (
     ("kind", "TEXT NOT NULL DEFAULT 'pr'"),
     ("issue_number", "INTEGER"),
     ("lane", "TEXT"),
+    ("tg_merge_message_id", "INTEGER"),
+    ("contract_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("contract_status", "TEXT"),
+    ("contract_json", "TEXT"),
+    ("planner_model", "TEXT"),
+    ("advisor_enabled", "INTEGER NOT NULL DEFAULT 1"),
+    ("advisor_model", "TEXT"),
+    ("plan_max_iterations", "INTEGER"),
 )
+
+# issue_tasks columns added after phase 5a.
+_ISSUE_TASK_MIGRATIONS = (
+    ("depends_on", "TEXT NOT NULL DEFAULT '[]'"),
+)
+
+
+async def _add_missing_columns(db: aiosqlite.Connection, table: str,
+                               migrations: tuple) -> None:
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        have = {row["name"] for row in await cur.fetchall()}
+    for col, decl in migrations:
+        if col not in have:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 async def connect(path: str) -> aiosqlite.Connection:
@@ -116,11 +187,8 @@ async def connect(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
     await db.executescript(SCHEMA)
-    async with db.execute("PRAGMA table_info(runs)") as cur:
-        have = {row["name"] for row in await cur.fetchall()}
-    for col, decl in _MIGRATIONS:
-        if col not in have:
-            await db.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
+    await _add_missing_columns(db, "runs", _MIGRATIONS)
+    await _add_missing_columns(db, "issue_tasks", _ISSUE_TASK_MIGRATIONS)
     await db.commit()
     return db
 
@@ -172,6 +240,23 @@ async def active_run_for_pr(db: aiosqlite.Connection, repo: str, pr_number: int)
     return _to_run(row) if row else None
 
 
+async def repaintable_run_for_pr(db: aiosqlite.Connection, repo: str,
+                                 pr_number: int) -> Run | None:
+    """The finished, unmerged run whose merge keyboard tracks this PR's checks.
+
+    Newest first: a re-run of the same PR leaves the older run's buttons behind,
+    and only the latest message is worth following.
+    """
+    async with db.execute(
+        "SELECT * FROM runs WHERE repo = ? AND pr_number = ? AND state = 'done' "
+        "AND merged_at IS NULL AND tg_merge_message_id IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (repo, pr_number),
+    ) as cur:
+        row = await cur.fetchone()
+    return _to_run(row) if row else None
+
+
 async def active_run_for_issue(db: aiosqlite.Connection, repo: str, issue_number: int) -> Run | None:
     marks = ",".join("?" * len(ACTIVE_STATES))
     async with db.execute(
@@ -194,6 +279,9 @@ async def save_run(db: aiosqlite.Connection, run: Run) -> None:
            approval_mode=?, staging_branch=?, preview_url=?,
            sandbox_expires_at=?, merged_at=?, tg_approval_message_id=?,
            kind=?, issue_number=?, lane=?, pr_number=?,
+           tg_merge_message_id=?,
+           contract_enabled=?, contract_status=?, contract_json=?,
+           planner_model=?, advisor_enabled=?, advisor_model=?, plan_max_iterations=?,
            updated_at=datetime('now') WHERE id=?""",
         (run.state, run.app_id, run.sandbox_id, run.task_id, run.spec_path,
          run.plan_path, run.prompt, run.timeout_minutes, run.error, run.summary,
@@ -205,9 +293,25 @@ async def save_run(db: aiosqlite.Connection, run: Run) -> None:
          run.approval_mode, run.staging_branch, run.preview_url,
          run.sandbox_expires_at, run.merged_at, run.tg_approval_message_id,
          run.kind, run.issue_number, run.lane, run.pr_number,
+         run.tg_merge_message_id,
+         run.contract_enabled, run.contract_status, run.contract_json,
+         run.planner_model, run.advisor_enabled, run.advisor_model,
+         run.plan_max_iterations,
          run.id),
     )
     await db.commit()
+
+
+async def latest_run_for_issue(db: aiosqlite.Connection, repo: str, issue_number: int,
+                               kind: str) -> Run | None:
+    """Newest run of `kind` raised for this issue, finished or not."""
+    async with db.execute(
+        "SELECT * FROM runs WHERE repo = ? AND issue_number = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (repo, issue_number, kind),
+    ) as cur:
+        row = await cur.fetchone()
+    return _to_run(row) if row else None
 
 
 async def runs_in_states(db: aiosqlite.Connection, states: set[str]) -> list[Run]:
@@ -261,6 +365,73 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+_TOKEN_COLS = ("tokens_input", "tokens_cache_write", "tokens_cache_read",
+               "tokens_output")
+
+
+async def save_stage_cost(db: aiosqlite.Connection, run_id: int, stage: str,
+                          model: str, fresh: bool | None, api_calls: int,
+                          tool_calls: int, tokens: dict, cost_usd: float) -> None:
+    """One row per (run, stage), replaced on a re-run.
+
+    A revise sends a Run back through execute/review/e2e, and the second pass is
+    the one that shipped — so the later numbers replace the earlier ones instead
+    of accumulating into a total nobody asked for.
+    """
+    await db.execute(
+        f"INSERT INTO run_stage_costs (run_id, stage, model, fresh, api_calls, "
+        f"tool_calls, {', '.join(_TOKEN_COLS)}, cost_usd, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(run_id, stage) DO UPDATE SET "
+        "model=excluded.model, fresh=excluded.fresh, api_calls=excluded.api_calls, "
+        "tool_calls=excluded.tool_calls, "
+        + ", ".join(f"{c}=excluded.{c}" for c in _TOKEN_COLS)
+        + ", cost_usd=excluded.cost_usd, updated_at=excluded.updated_at",
+        (run_id, stage, model or "", None if fresh is None else int(fresh),
+         api_calls, tool_calls, tokens.get("input", 0), tokens.get("cache_write", 0),
+         tokens.get("cache_read", 0), tokens.get("output", 0), cost_usd, utcnow()),
+    )
+    await db.commit()
+
+
+async def refresh_run_trace(db: aiosqlite.Connection, run_id: int,
+                            trace_id: str) -> None:
+    """Recompute the Run total from its stage rows."""
+    async with db.execute(
+        f"SELECT COALESCE(SUM(api_calls),0) a, COALESCE(SUM(tool_calls),0) t, "
+        + ", ".join(f"COALESCE(SUM({c}),0) {c}" for c in _TOKEN_COLS)
+        + ", COALESCE(SUM(cost_usd),0) c FROM run_stage_costs WHERE run_id=?",
+        (run_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    await db.execute(
+        f"INSERT INTO run_traces (run_id, trace_id, api_calls, tool_calls, "
+        f"{', '.join(_TOKEN_COLS)}, cost_usd, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(run_id) DO UPDATE SET trace_id=excluded.trace_id, "
+        "api_calls=excluded.api_calls, tool_calls=excluded.tool_calls, "
+        + ", ".join(f"{c}=excluded.{c}" for c in _TOKEN_COLS)
+        + ", cost_usd=excluded.cost_usd, updated_at=excluded.updated_at",
+        (run_id, trace_id, row["a"], row["t"], row["tokens_input"],
+         row["tokens_cache_write"], row["tokens_cache_read"], row["tokens_output"],
+         row["c"], utcnow()),
+    )
+    await db.commit()
+
+
+async def trace_rollup_for_run(db: aiosqlite.Connection, run_id: int) -> dict | None:
+    async with db.execute("SELECT * FROM run_traces WHERE run_id=?", (run_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    async with db.execute(
+        "SELECT * FROM run_stage_costs WHERE run_id=? ORDER BY stage", (run_id,),
+    ) as cur:
+        out["stages"] = [dict(r) for r in await cur.fetchall()]
+    return out
+
+
 async def run_by_approval_message(db: aiosqlite.Connection,
                                   message_id: int | None) -> Run | None:
     if message_id is None:
@@ -271,3 +442,30 @@ async def run_by_approval_message(db: aiosqlite.Connection,
     ) as cur:
         row = await cur.fetchone()
     return _to_run(row) if row else None
+
+
+async def save_contract(db: aiosqlite.Connection, repo: str, issue_number: int,
+                        run_id: int | None, pr_number: int | None, head_sha: str,
+                        contract_md: str, sources: list[str],
+                        breaking: list[str]) -> None:
+    """One row per producing issue, replaced on every re-capture."""
+    await db.execute(
+        "INSERT INTO upstream_contracts (repo, issue_number, run_id, pr_number, "
+        "head_sha, contract_md, sources_json, breaking_json, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,datetime('now')) "
+        "ON CONFLICT(repo, issue_number) DO UPDATE SET run_id=excluded.run_id, "
+        "pr_number=excluded.pr_number, head_sha=excluded.head_sha, "
+        "contract_md=excluded.contract_md, sources_json=excluded.sources_json, "
+        "breaking_json=excluded.breaking_json, created_at=excluded.created_at",
+        (repo, issue_number, run_id, pr_number, head_sha, contract_md,
+         json.dumps(sources), json.dumps(breaking)))
+    await db.commit()
+
+
+async def get_contract(db: aiosqlite.Connection, repo: str,
+                       issue_number: int) -> dict | None:
+    async with db.execute(
+            "SELECT * FROM upstream_contracts WHERE repo=? AND issue_number=?",
+            (repo, issue_number)) as cur:
+        row = await cur.fetchone()
+    return dict(row) if row else None

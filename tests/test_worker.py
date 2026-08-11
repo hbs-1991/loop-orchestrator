@@ -1,8 +1,10 @@
 import asyncio
 
 from loop_orchestrator import db as dbmod
+from loop_orchestrator.actions import Gate
 from loop_orchestrator.models import (
     AWAITING_APPROVAL,
+    DONE,
     E2E_TESTING,
     EXECUTING,
     FAILED,
@@ -14,7 +16,7 @@ from loop_orchestrator.models import (
 )
 from loop_orchestrator.worker import Worker
 
-from tests.conftest import FakeSettings
+from tests.conftest import FakeSettings, FakeTG
 
 
 class RecordingPipeline:
@@ -110,6 +112,66 @@ async def test_reap_expired_previews(db):
     await dbmod.save_run(db, torn_down)
     await worker.reap_expired_once()
     assert pipeline.expired == [expired.id]
+
+
+class FakeGateActions:
+    """Stands in for Actions.gate — the reaper only reads the gate."""
+    def __init__(self, gate):
+        self.gate_value = gate
+        self.reads = 0
+
+    async def gate(self, run):
+        self.reads += 1
+        return self.gate_value
+
+
+class FakePipelineWithTG:
+    def __init__(self, tg):
+        self.tg = tg
+
+
+async def test_merge_buttons_follow_the_gate(db):
+    tg = FakeTG()
+    worker = Worker(db=db, settings=FakeSettings(), pipeline=FakePipelineWithTG(tg))
+    worker.actions = FakeGateActions(Gate("checks_pending", "main", [], 2, 3))
+    run = await dbmod.create_run(db, "o/r", 5, "feat/x")
+    run.state = DONE
+    run.tg_merge_message_id = 909
+    await dbmod.save_run(db, run)
+
+    await worker.refresh_merge_buttons_once()
+
+    (message_id, markup), = tg.buttons
+    assert message_id == 909
+    assert markup["inline_keyboard"][0][0]["text"] == "⏳ CI 2/3"
+
+    # Repainted every pass, not diffed: a press clears this keyboard, and a
+    # memo would then decide "unchanged" and leave the message button-less.
+    await worker.refresh_merge_buttons_once()
+    assert len(tg.buttons) == 2
+
+    worker.actions.gate_value = Gate("clean", "main", [], 3, 3)
+    await worker.refresh_merge_buttons_once()
+    assert [b["callback_data"] for b in tg.buttons[-1][1]["inline_keyboard"][0]] == \
+        [f"mg:{run.id}", f"md:{run.id}"]
+
+
+async def test_merged_and_button_less_runs_are_left_alone(db):
+    tg = FakeTG()
+    worker = Worker(db=db, settings=FakeSettings(), pipeline=FakePipelineWithTG(tg))
+    worker.actions = FakeGateActions(Gate("clean", "main", []))
+    merged = await dbmod.create_run(db, "o/r", 5, "feat/x")
+    merged.state, merged.merged_at = DONE, "2026-08-08 10:00:00"
+    merged.tg_merge_message_id = 909
+    await dbmod.save_run(db, merged)
+    # A run whose "finished" message never came back with an id: nothing to edit.
+    idless = await dbmod.create_run(db, "o/r", 6, "feat/y")
+    idless.state = DONE
+    await dbmod.save_run(db, idless)
+
+    await worker.refresh_merge_buttons_once()
+
+    assert tg.buttons == [] and worker.actions.reads == 0
 
 
 async def test_recover_requeues_planning_runs(db):

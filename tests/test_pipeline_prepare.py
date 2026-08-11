@@ -3,6 +3,7 @@ import json
 import pytest
 
 from loop_orchestrator import db as dbmod
+from loop_orchestrator import issue_tasks as it
 from loop_orchestrator.models import Run
 from loop_orchestrator.pipeline import Pipeline, RunFailure, app_name, build_prompt
 
@@ -221,3 +222,32 @@ async def test_prepare_no_e2e_block_disables(db, tmp_path):
     run = await dbmod.create_run(db, "o/r", 1, "feat")
     await p._prepare(run)
     assert run.e2e_enabled is False
+
+
+async def test_prepare_uploads_the_upstream_context(db, tmp_path):
+    gh, sb = FakeGitHub(), FakeSandboxd()
+    seed_ok(gh, tmp_path)
+    gh.files["src/api.py"] = "print('real')"
+    await dbmod.save_contract(db, "o/backend", 12, run_id=1, pr_number=45,
+                              head_sha="abc", contract_md="### POST /v1/x",
+                              sources=["src/api.py"], breaking=[])
+    await it.upsert_task(db, "o/myrepo", 13, "F", None)
+    await it.set_depends_on(db, "o/myrepo", 13,
+                            [{"repo": "o/backend", "number": 12}])
+    run = await dbmod.create_run(db, "o/myrepo", 5, "feat/x")
+    run.issue_number = 13
+    await dbmod.save_run(db, run)
+    pipe = make_pipeline(db, tmp_path, gh=gh, sb=sb)
+    await pipe._prepare(run)
+    written = {p: c for _, p, c in sb.files_written}
+    assert written[".loop/context/o/backend/src/api.py"] == "print('real')"
+    assert "o/backend#12" in written[".loop/context/README.md"]
+
+
+async def test_prepare_without_dependencies_writes_no_context(db, tmp_path):
+    gh, sb = FakeGitHub(), FakeSandboxd()
+    seed_ok(gh, tmp_path)
+    run = await dbmod.create_run(db, "o/myrepo", 5, "feat/x")
+    pipe = make_pipeline(db, tmp_path, gh=gh, sb=sb)
+    await pipe._prepare(run)
+    assert not any(p.startswith(".loop/context/") for _, p, _ in sb.files_written)

@@ -5,7 +5,7 @@ import httpx
 from fastapi import FastAPI
 
 from loop_orchestrator import db as dbmod
-from loop_orchestrator.actions import ActionError
+from loop_orchestrator.actions import ActionError, Gate
 from loop_orchestrator.telegram_webhook import router
 
 from tests.conftest import FakeTG
@@ -17,6 +17,7 @@ class FakeActions:
     def __init__(self):
         self.calls: list[tuple] = []
         self.error: ActionError | None = None
+        self.gate_value = Gate("checks_pending", "main", [], 2, 3)
 
     async def approve(self, run_id, actor):
         if self.error:
@@ -27,6 +28,14 @@ class FakeActions:
     async def revise(self, run_id, actor, feedback):
         self.calls.append(("revise", run_id, actor, feedback))
         return "✏️ sent"
+
+    async def update_branch(self, run_id, actor):
+        self.calls.append(("update_branch", run_id, actor))
+        return "⤴️ updated"
+
+    async def gate(self, run):
+        self.calls.append(("gate", run.id))
+        return self.gate_value
 
 
 class Settings:
@@ -85,6 +94,27 @@ async def test_callback_dispatches_action_and_clears_buttons(tmp_path):
     assert any(s.startswith("cb:cb1") for s in app.state.tg.sent)   # answered
     assert "clear:555" in app.state.tg.sent                          # buttons removed
     assert any("✅ approved" in s for s in app.state.tg.sent)        # result in thread
+
+
+async def test_indicator_press_reports_the_gate_without_acting(tmp_path):
+    """The ⏳ button is not an action: it re-reads the gate and answers in the
+    toast, so the keyboard can be refreshed without waiting for the reaper."""
+    app = await make_app(tmp_path)
+    run = await dbmod.create_run(app.state.db, "o/r", 1, "b")
+    r = await post(app, cb(f"ck:{run.id}"))
+    assert r.status_code == 200
+    await drain(app)
+    assert app.state.actions.calls == [("gate", run.id)]     # read, never merged
+    assert any("checks 2/3 done" in s for s in app.state.tg.sent)
+    assert not any(s.startswith("clear:") for s in app.state.tg.sent)
+
+
+async def test_update_branch_button_is_routed(tmp_path):
+    app = await make_app(tmp_path)
+    run = await dbmod.create_run(app.state.db, "o/r", 1, "b")
+    await post(app, cb(f"ub:{run.id}"))
+    await drain(app)
+    assert ("update_branch", run.id, 100) in app.state.actions.calls
 
 
 async def test_unauthorized_click_answered_without_action(tmp_path):

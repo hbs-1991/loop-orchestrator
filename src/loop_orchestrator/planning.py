@@ -1,6 +1,7 @@
 """Planning protocol: planner/advisor prompts, JSON parsing, task snapshot."""
 from dataclasses import dataclass, field
 
+from .contracts import CONTEXT_DIR, Upstream, render_upstream_section
 from .jsonextract import find_json_object
 from .loopconfig import plans_dir
 from .secrets import source_hint
@@ -98,6 +99,15 @@ def build_planner_prompt(issue_number: int, spec_path: str, plan_path: str,
         "document at exactly the path above rather than the skill's default.\n\n"
         "The plan is executed by an autonomous agent that cannot ask you anything, "
         "so every gap you leave becomes a guess it makes on its own.\n"
+        "An interface you do not own — an API of another service or repository — "
+        "may be planned against exactly three sources: code in this repository, "
+        f"files under `{CONTEXT_DIR}/`, and the `## Upstream dependencies` section "
+        f"of {TASK_FILE}. Read them before you write an endpoint, a path, a field "
+        "name or a status code.\n"
+        "If what the task needs is in none of the three, do not invent a "
+        "plausible one: a guessed interface passes review and fails only when the "
+        "code runs. Ask instead — return the questions outcome naming the "
+        "endpoint you could not confirm.\n\n"
         "Write both files and make a single git commit containing ONLY them. "
         "Never commit dependency lockfiles (uv.lock, package-lock.json, "
         "pnpm-lock.yaml, yarn.lock, poetry.lock, Cargo.lock): installing "
@@ -114,15 +124,46 @@ def build_planner_prompt(issue_number: int, spec_path: str, plan_path: str,
     )
 
 
-def build_planner_revise_prompt(verdict: AdvisorVerdict) -> str:
+def build_planner_revise_prompt(verdict: AdvisorVerdict, issue_number: int,
+                                spec_path: str, plan_path: str) -> str:
+    """Revise round for the planner — a fresh session, so self-contained.
+
+    It cannot continue the session that wrote the documents: sandboxd resumes
+    *the most recent* session and the advisor ran after the planner, so
+    `continue` would hand the planner the advisor's context. Nor is resuming
+    worth chasing — an advisor round outlives the five-minute prompt cache, so
+    the whole inherited context would be re-billed at write price
+    ([[decisions/0013-one-session-per-stage]]). Re-reading three files costs
+    less, and a planner that does not remember defending the documents edits
+    them more honestly.
+
+    No setup command: the dependencies were installed in round 0 and this is
+    the same sandbox.
+    """
     issues = "\n".join(f"- {i}" for i in verdict.issues)
     return (
-        "The Implementor Advisor reviewed your specification and plan and "
-        "requires changes before implementation can start.\n\n"
+        "You are a planning agent for this repository.\n"
+        "An earlier round of this run wrote a specification and an "
+        "implementation plan for GitHub issue "
+        f"#{issue_number} (the task is in {TASK_FILE}). The Implementor "
+        "Advisor reviewed them and requires changes before implementation can "
+        "start.\n\n"
+        f"Specification: {spec_path}\n"
+        f"Plan: {plan_path}\n\n"
         f"Advisor summary: {verdict.summary}\n"
         f"Issues to address:\n{issues}\n\n"
-        "Update the specification and plan files accordingly and commit the "
-        "changes. Do not git push. Do not switch branches.\n"
+        f"Read {TASK_FILE} and both documents first — you are in a new session "
+        "and have not seen them yet — then update them so every issue above is "
+        "resolved. Keep the structure the `writing-specs` and `writing-plans` "
+        "skills define, and keep each document at exactly the path above.\n"
+        "The plan is executed by an autonomous agent that cannot ask you "
+        "anything, so every gap you leave becomes a guess it makes on its own.\n"
+        "Commit only those two files. Never commit dependency lockfiles "
+        "(uv.lock, package-lock.json, pnpm-lock.yaml, yarn.lock, poetry.lock, "
+        "Cargo.lock): restore any changed lockfile with `git checkout -- "
+        "<file>` before committing.\n"
+        "Do not git push. Do not switch branches. Do not implement the feature "
+        "itself.\n\n"
         "Finish with the same JSON schema as before:\n"
         f"{PLANNER_OUTPUT_SCHEMA}"
     )
@@ -147,6 +188,12 @@ def build_advisor_prompt(spec_path: str, plan_path: str) -> str:
         "bite-sized TDD steps rather than vague instructions; exact file paths; "
         "real code in steps that change code; commands that actually work in "
         "this repository; and consistent names and signatures across tasks.\n"
+        "Check every external interface the documents rely on: each endpoint, "
+        "field name and status code must be traceable to code in this "
+        f"repository, to a file under `{CONTEXT_DIR}/`, or to the "
+        f"`## Upstream dependencies` section of {TASK_FILE}. One that is "
+        "traceable to none of them is invented, however plausible it reads — "
+        "raise it as an issue naming that endpoint.\n"
         "Only raise issues that would produce a wrong or stalled implementation. "
         "Wording preferences and unevenly detailed sections are not issues — "
         "approve when the pair is good enough to implement from.\n"
@@ -157,7 +204,8 @@ def build_advisor_prompt(spec_path: str, plan_path: str) -> str:
     )
 
 
-def build_task_file(issue: dict, comments: list[dict]) -> str:
+def build_task_file(issue: dict, comments: list[dict],
+                    upstreams: "list[Upstream] | tuple" = ()) -> str:
     labels = ", ".join(
         (lbl["name"] if isinstance(lbl, dict) else str(lbl))
         for lbl in (issue.get("labels") or []))
@@ -170,4 +218,7 @@ def build_task_file(issue: dict, comments: list[dict]) -> str:
         for c in comments:
             author = (c.get("user") or {}).get("login") or "unknown"
             lines += [f"**{author}:**", c.get("body") or "", ""]
+    section = render_upstream_section(list(upstreams))
+    if section:
+        lines += [section]
     return "\n".join(lines)

@@ -6,6 +6,7 @@ neither touches the pipeline or worker directly. Every action validates
 its effect. Invalid requests raise ActionError with a user-facing message.
 """
 import asyncio
+from typing import NamedTuple
 
 from . import db as dbmod
 from . import issue_tasks as it
@@ -21,19 +22,28 @@ from .models import (
     Run,
 )
 from .pipeline import MAX_TASK_TIMEOUT_S, SyncError
+from .review import build_revise_prompt
 from .state_machine import transition
-
-REVISE_PROMPT = (
-    "A human reviewer looked at the staged result and left feedback:\n\n"
-    "{feedback}\n\n"
-    "Address the feedback in this repository, run the tests if a test command "
-    "was given earlier, commit your changes, and finish with a short summary "
-    "of what you changed."
-)
 
 
 class ActionError(Exception):
     """The action is not applicable; str(e) is safe to show to the user."""
+
+
+class Gate(NamedTuple):
+    """What the merge gate sees for one PR.
+
+    `state` is one of "clean" | "behind" | "conflicts" | "checks_failed" |
+    "checks_pending". `red` carries the failed check names when the state is
+    checks_failed, and the still-missing required ones when checks_pending.
+    `done`/`total` count finished checks against the ones that hold the merge —
+    they exist for the button, not for the decision.
+    """
+    state: str
+    base: str
+    red: list[str]
+    done: int = 0
+    total: int = 0
 
 
 class Actions:
@@ -84,11 +94,31 @@ class Actions:
                 raise ActionError(
                     f"run #{run.id}: the sandbox has expired — approve, discard "
                     "or restart instead")
+            # Feedback on the executor's work belongs in the executor's session
+            # — but sandboxd's `continue` resumes *the most recent* session and
+            # offers no way to name an older one, so it only lands there when
+            # nothing ran after the executor. Review and e2e each open a session
+            # of their own; with either of them on, `continue` would resume the
+            # reviewer or the e2e agent, which knows the tests and not the
+            # implementation. Then a fresh session with a prompt that restates
+            # the branch, the documents and the test command is both cheaper and
+            # better informed.
+            resumed = not (run.review_enabled or run.e2e_enabled)
+            # The pause sleeps its sandbox (see Pipeline._sleep_pause), so wake
+            # it before submitting. Idempotent on a running one, and it returns
+            # only once the container is up, so the submit that follows does not
+            # race the start.
+            await self.sb.start_sandbox(run.sandbox_id)
             try:
                 run.task_id = await self.sb.submit_task(
-                    run.sandbox_id, REVISE_PROMPT.format(feedback=feedback),
+                    run.sandbox_id,
+                    build_revise_prompt(feedback, run.test_cmd,
+                                        head_branch=run.head_branch,
+                                        spec_path=run.spec_path,
+                                        plan_path=run.plan_path,
+                                        resumed=resumed),
                     timeout_s=min(run.timeout_minutes * 60, MAX_TASK_TIMEOUT_S),
-                    continue_session=True)
+                    continue_session=resumed)
             except Exception as e:  # noqa: BLE001 — dead sandbox, network, ...
                 raise ActionError(f"run #{run.id}: could not reach the sandbox "
                                   f"({e}) — approve, discard or restart") from e
@@ -200,14 +230,39 @@ class Actions:
     async def merge_deploy(self, run_id: int, actor: int) -> str:
         return await self._merge(run_id, actor, promote=True)
 
+    async def update_branch(self, run_id: int, actor: int) -> str:
+        """Merge the base into the PR branch — the `⤴️ Update branch` button.
+
+        A separate action rather than a press of Merge that happens to find the
+        branch stale: the button says one thing, so it must not merge if the
+        gate turned clean in between.
+        """
+        async with self._lock:
+            run = await self._load(run_id, DONE)
+            if run.merged_at:
+                raise ActionError(f"run #{run.id}: the PR is already merged")
+            g = await self._merge_readiness(run)
+            if g.state != "behind":
+                raise ActionError(
+                    f"run #{run.id}: the branch is not behind `{g.base}` "
+                    "any more — nothing to update")
+            await self.gh.update_pr_branch(run.repo, run.pr_number)
+            await dbmod.add_event(self.db, run.id, DONE, DONE,
+                                  f"PR branch updated from {g.base} by tg:{actor}")
+            return (f"⤴️ run #{run.id}: the PR branch was behind `{g.base}` and "
+                    "has been updated; the buttons will follow the re-run")
+
     # A check run with one of these conclusions means CI did not vouch for
     # the commit: failure and timeout obviously; cancelled because a killed
     # run verified nothing; action_required because it is blocked on a human.
     _RED_CONCLUSIONS = ("failure", "timed_out", "cancelled", "action_required")
 
-    async def _merge_readiness(self, run: Run) -> tuple[str, str, list[str]]:
-        """("clean"|"behind"|"conflicts"|"checks_failed"|"checks_pending",
-        base ref, red check names) — best-effort, defaults clean.
+    async def gate(self, run: Run) -> Gate:
+        """Public read of the merge gate — the reaper paints buttons with it."""
+        return await self._merge_readiness(run)
+
+    async def _merge_readiness(self, run: Run) -> Gate:
+        """What the gate sees; best-effort, defaults to clean.
 
         GitHub computes mergeability lazily; a few short polls ride out the
         `mergeable: null` window. Any API trouble falls back to "clean" so
@@ -223,31 +278,50 @@ class Actions:
                 await asyncio.sleep(2)
             base = (pr.get("base") or {}).get("ref") or "main"
             if pr.get("mergeable") is False:
-                return "conflicts", base, []
+                return Gate("conflicts", base, [])
             if pr.get("mergeable_state") == "behind":
-                return "behind", base, []
+                return Gate("behind", base, [])
+            # Only a strict base reports "behind" above, and the work repos
+            # have no such rule — so ask `compare` directly. A green check run
+            # on a stale branch measures a tree that will not exist after the
+            # merge: the classic case is two branches that each added "the
+            # next" numbered migration, which merge without a conflict and
+            # fork the graph in main. Updating first puts both of them in one
+            # tree while the PR can still be the thing that goes red.
+            head_ref = (pr.get("head") or {}).get("ref")
+            if head_ref and await self.gh.behind_by(run.repo, base, head_ref):
+                return Gate("behind", base, [])
             sha = (pr.get("head") or {}).get("sha")
-            if sha:
-                checks = await self.gh.list_check_runs(run.repo, sha)
-                red = [c.get("name") or "?" for c in checks
-                       if c.get("conclusion") in self._RED_CONCLUSIONS]
-                if red:
-                    return "checks_failed", base, red
-                if any(c.get("status") != "completed" for c in checks):
-                    return "checks_pending", base, []
-                # An empty list means "no checks yet", not "no checks at all".
-                # Right after a fast-forward — the conflict resolver's last
-                # step — GitHub has not created the new head's runs, and
-                # merging into that window is refused by the ruleset anyway
-                # ("Required status check ci is queued", seen on run #40).
-                done = {c.get("name") for c in checks}
-                missing = [n for n in await self.gh.required_checks(run.repo, base)
-                           if n not in done]
-                if missing:
-                    return "checks_pending", base, missing
-            return "clean", base, []
+            if not sha:
+                return Gate("clean", base, [])
+            checks = await self.gh.list_check_runs(run.repo, sha)
+            required = await self.gh.required_checks(run.repo, base)
+            finished = {c.get("name") for c in checks
+                        if c.get("status") == "completed"}
+            # Progress is counted against the ruleset when there is one, so the
+            # button reads "2/3" of the checks that actually hold the merge
+            # rather than of whatever happens to have started.
+            total = len(required) or len(checks)
+            done = (sum(1 for n in required if n in finished) if required
+                    else len(finished))
+            red = [c.get("name") or "?" for c in checks
+                   if c.get("conclusion") in self._RED_CONCLUSIONS]
+            if red:
+                return Gate("checks_failed", base, red, done, total)
+            if any(c.get("status") != "completed" for c in checks):
+                return Gate("checks_pending", base, [], done, total)
+            # An empty list means "no checks yet", not "no checks at all".
+            # Right after a fast-forward — the conflict resolver's last
+            # step — GitHub has not created the new head's runs, and
+            # merging into that window is refused by the ruleset anyway
+            # ("Required status check ci is queued", seen on run #40).
+            present = {c.get("name") for c in checks}
+            missing = [n for n in required if n not in present]
+            if missing:
+                return Gate("checks_pending", base, missing, done, total)
+            return Gate("clean", base, [], done, total)
         except Exception:  # noqa: BLE001
-            return "clean", "main", []
+            return Gate("clean", "main", [])
 
     async def _merge(self, run_id: int, actor: int, promote: bool,
                      auto_sync: bool = True) -> str:
@@ -256,7 +330,8 @@ class Actions:
             run = await self._load(run_id, DONE)
             if run.merged_at:
                 raise ActionError(f"run #{run.id}: the PR is already merged")
-            readiness, base, red = await self._merge_readiness(run)
+            g = await self._merge_readiness(run)
+            readiness, base, red = g.state, g.base, g.red
             if readiness == "checks_failed":
                 raise ActionError(
                     f"run #{run.id}: CI is red on the PR head "
@@ -277,9 +352,11 @@ class Actions:
                         "started a conflict-resolution agent; the merge will "
                         "be retried automatically when it finishes")
             if readiness == "behind":
-                # Protected base requires an up-to-date branch: update it and
-                # let the re-run checks gate the next press — auto-merging
-                # here would race them.
+                # Update the branch and let the re-run checks gate the next
+                # press — auto-merging here would race them. The extra press
+                # is only spent on a branch that really is stale: at
+                # behind_by == 0 nothing is synced, because an empty merge
+                # commit costs a full CI run of its own.
                 await self.gh.update_pr_branch(run.repo, run.pr_number)
                 await dbmod.add_event(self.db, run.id, DONE, DONE,
                                       f"PR branch updated from {base} by tg:{actor}")

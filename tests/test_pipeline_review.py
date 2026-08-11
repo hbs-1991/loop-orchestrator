@@ -56,6 +56,7 @@ async def test_findings_then_fix_then_clean(db, tmp_path):
     assert run.review_status == "clean" and run.review_iteration == 1
     fix_task = sb.tasks_submitted[2]
     assert fix_task["model"] is None  # fix runs on the agent's default model
+    assert fix_task["continue"] is False  # works from the verdict, not the session
     assert "bug A" in fix_task["prompt"] and "npm test" in fix_task["prompt"]
     report = json.loads(run.review_json)
     assert [f["title"] for f in report["fixed"]] == ["bug A"]

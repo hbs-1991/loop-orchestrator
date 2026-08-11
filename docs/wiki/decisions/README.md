@@ -19,3 +19,7 @@ table and in [../index.md](../index.md), an entry in [../log.md](../log.md).
 | [0009](0009-concurrency-cap-and-poll-resilience.md) | A cap of 2 concurrent Runs; polling tolerates transport failures | 2026-08-05 |
 | [0010](0010-documentation-in-english.md) | Every document in the repository is English — the project is headed for open source | 2026-08-06 |
 | [0011](0011-no-environment-specifics-in-the-repo.md) | No environment specifics in documents: hosts, domains, accounts and repo names are placeholders | 2026-08-06 |
+| [0012](0012-one-bigger-host-over-a-multi-host-pool.md) | One bigger host (4 vCPU / 16 GB) instead of a pool of small ones; measured sizing rule | 2026-08-06 |
+| [0013](0013-one-session-per-stage.md) | One Claude session per stage, and the `continue` tri-state | 2026-08-06 | accepted |
+| [0014](0014-hand-rolled-otlp-emitter.md) | A hand-rolled OTLP emitter, not the OpenTelemetry SDK | 2026-08-06 | accepted |
+| [0015](0015-sleep-the-paused-sandbox.md) | The paused sandbox sleeps; its preview wakes it on demand via `sandbox.yaml` | 2026-08-08 | accepted |
